@@ -10,24 +10,6 @@ import requests
 from urllib.parse import parse_qs, urlparse
 from tinydb import TinyDB, where
 
-class User(object):
-	def __init__(self, user_json_object):
-		self.user_id = user_json_object['id'].split('-')[0]
-		self.name = user_json_object['name']
-
-	def to_db_dict(self):
-		return {
-			'id': self.user_id,
-			'name': self.name
-		}
-
-	@staticmethod
-	def from_db_dict(db_dict, ws=None):
-		return User({'id': db_dict['id']+'-', 'name': db_dict['name']})
-
-	def __str__(self):
-		return self.name
-
 class Message(object):
 	def __init__(self, ws, data):
 		self.data = data
@@ -67,40 +49,128 @@ class Packet(object):
 #{"id":"","type":"send-event","data":{"id":"00cr0zhdfpj40","parent":"","time":1428420388,"sender":{"id":"0bf0b63a5b0434e8-000000b3","name":"G3","server_id":"heim.1","server_era":"00cqy7ymu43cw"},"content":"I'll have to explore their music a little as well.","edited":null,"deleted":null}}
 #"sender":{"id":"0bf0b63a5b0434e8-000000b3","name":"G3","server_id":"heim.1","server_era":"00cqy7ymu43cw"}
 
+class DBField(object):
+	FIELD_NAME = ""
 
-class YoutubeInfo(object):
+	# don't touch these
 
-	@staticmethod
-	def get_from_url(youtube_url):
-		info_url = 'http://gdata.youtube.com/feeds/api/videos/{}?alt=json'
-		query = urlparse(youtube_url).query
-		youtube_id = parse_qs(query)['v'][0]
-		url = info_url.format(youtube_id)
-		resp = requests.get(url)
-		youtube_info = resp.json()['entry']
-		return YoutubeInfo(
-			youtube_url,
-			youtube_info['title']['$t'],
-			youtube_info['content']['$t'],
-			youtube_info['media$group']['media$thumbnail'],
-			youtube_info['media$group']['yt$duration'])
+	@classmethod
+	def create_field(cls, db_item, message_or_db):
+		if isinstance(message_or_db, Message):
+			self = cls.create_from_message(message_or_db)
+		else:
+			self = cls.create_from_db_dict(message_or_db[cls.FIELD_NAME])
+		cls._init(db_item, self)
 
-	def __init__(self, url, title, sub_title, thumbnails, duration):
-		self.url = url
-		self.title = title
-		self.sub_title = sub_title
-		self.thumbnails = thumbnails
-		self.duration = duration
+	@classmethod
+	def field_to_db(cls, db_item, db_dict):
+		db_dict[cls.FIELD_NAME] = cls._self(db_item).to_db_dict()
+		return db_dict
 
-	def time_seconds(self):
-		assert(len(self.duration.keys()) == 1)
-		return int(self.duration['seconds'])
+	@classmethod
+	def _init(cls, db_item, new_self):
+		setattr(db_item, cls.FIELD_NAME, new_self)
 
-	def time_string(self):
-		return str(timedelta(seconds=self.time_seconds()))
+	@classmethod
+	def _self(cls, db_item):
+		if hasattr(db_item, cls.FIELD_NAME):
+			return getattr(db_item, cls.FIELD_NAME)
+		return None
 
-	def select_thumbnail(self):
-		return self.thumbnails[0]['url']
+	@classmethod
+	def is_prepared(cls, db_item):
+		self = cls._self(db_item)
+		if self:
+			return self.is_prepared
+		return True
+
+	@classmethod
+	def prepare(cls, db_item):
+		cls._self(db_item).prepare_self()
+		pass
+
+	# override these
+
+	def __init__(self, prepared=True):
+		self.is_prepared = prepared
+
+	@classmethod
+	def create_from_message(cls, message):
+		return {}
+
+	def prepare_self(self):
+		pass
+
+	# single value fields can keep these
+	@classmethod
+	def create_from_field(cls, field):
+		return cls(field)
+
+	def to_db_dict(self):
+		return str(self)
+
+
+
+class User(DBField):
+	FIELD_NAME = "user"
+
+	@classmethod
+	def create_from_message(cls, message):
+		sender = message.data['sender']
+		return User(sender['id'].split('-')[0], sender['name'])	
+
+	@classmethod
+	def create_from_db_dict(cls, field):
+		return User(field['id'], field['name'])
+	
+	def to_db_dict(self):
+		return {
+			'id': self.user_id,
+			'name': self.name
+		}
+
+	def __init__(self, user_id, name):
+		super(User, self).__init__()
+		self.user_id = user_id
+		self.name = name
+
+	def __str__(self):
+		return self.name
+
+class Parent(DBField):
+	FIELD_NAME = "parent_id"
+
+	@classmethod
+	def create_from_message(cls, message):
+		return Parent(message.data['id'])
+
+	def __init__(self, parent_id):
+		super(Parent, self).__init__()
+		self.parent_id = parent_id
+
+	def __str__(self):
+		return self.parent_id
+
+class YoutubeInfo(DBField):
+
+	INFO_URL = 'http://gdata.youtube.com/feeds/api/videos/{}?alt=json'
+	#REGEX = '{}\s*([^\s]+)\s?'
+	REGEX = r'((https?://)?youtube\S+)'
+	FIELD_NAME = 'youtube_info'
+
+	@classmethod
+	def create_from_message(cls, message):
+		# returns list of tuples
+		urls = re.findall(cls.REGEX, message.data['content'])
+		print('youtube init: ', urls[0])
+		return YoutubeInfo(urls[0][0])	
+
+	@classmethod
+	def create_from_field_dict(cls, field):
+		self = YoutubeInfo(field['url'])
+		self.set_data(field['title'], field['sub_title'],
+			 field['thumbnails'], field['duration'])
+		return self
 
 	def to_db_dict(self):
 		return {
@@ -111,42 +181,108 @@ class YoutubeInfo(object):
 			'duration': self.duration,
 		}
 
-	@staticmethod
-	def from_db_dict(db_dict, ws=None):
-		return YoutubeInfo(
-			db_dict['url'],
-			db_dict['title'],
-			db_dict['sub_title'],
-			db_dict['thumbnails'],
-			db_dict['duration']
-			)
+	def __init__(self, url):
+		super(YoutubeInfo, self).__init__(prepared=False)
+		self.url = url if url.find('http') == 0 else 'https://' + url
+		
+	def set_data(self, title, sub_title, thumbnails, duration):
+		self.title = title
+		self.sub_title = sub_title
+		self.thumbnails = thumbnails
+		self.duration = duration
+		self.is_prepared = True
+
+	def prepare_self(self):
+		query = urlparse(self.url).query
+		youtube_id = parse_qs(query)['v'][0]
+		url = self.INFO_URL.format(youtube_id)
+		resp = requests.get(url)
+		youtube_info = resp.json()['entry']
+
+		self.set_data( youtube_info['title']['$t'], youtube_info['content']['$t'],
+			youtube_info['media$group']['media$thumbnail'], youtube_info['media$group']['yt$duration'])
+			
+
+	def time_seconds(self):
+		if not self.is_prepared:
+			return 0
+		assert(len(self.duration.keys()) == 1)
+		return int(self.duration['seconds'])
+
+	def time_string(self):
+		return str(timedelta(seconds=self.time_seconds()))
+
+	def select_thumbnail(self):
+		if not self.is_prepared:
+			return ''
+		return self.thumbnails[0]['url']
 
 	def __str__(self):
-		return '{} [{}]'.format(self.title, self.time_string())
+		if not self.is_prepared:
+			return self.url
+		else:
+			return '{} [{}]'.format(self.title, self.time_string())
+
 
 class DBItem(object):
 	DB_TAG = "database_"
 
 	SUBCLASSES = {}
 
+	CLASS_FIELDS = [User]
+
 	def __init__(self, message_or_db):
 		if not isinstance(message_or_db, Message):
 			self.timestamp = message_or_db['timestamp']
-			self.user = User.from_db_dict(message_or_db['user'])
+			#self.user = User.from_db_dict(message_or_db['user'])
 			self.uid = message_or_db['uid']
 		else:
 			self.timestamp = message_or_db.timestamp
-			self.user = User(message_or_db.data['sender'])
+			#self.user = User(message_or_db.data['sender'])
 			self.uid = message_or_db.data['id']
 
+		self.add_fields(self, DBItem.CLASS_FIELDS)
+		self.create_fields(message_or_db)
+
+	@staticmethod
+	def add_fields(self, fields):
+		if not hasattr(self, '_fields'):
+			self._fields = set()
+		for field in fields:
+			self._fields.add(field)
+
+	def create_fields(self, message_or_db):
+		for field in self._fields:
+			field.create_field(self, message_or_db)
+
+	def prepare(self):
+		for field in self._fields:
+			field.prepare(self)
+
+	def is_prepared(self):
+		prepared = True
+		for field in self._fields:
+			prepared = prepared and field.is_prepared(self)
+
+		return prepared
+
 	def to_db_dict(self):
-		return {
+		db_dict = {
 			'type': self.DB_TAG,
 			'uid': self.uid,
 			'timestamp': self.timestamp,
-			'user': self.user.to_db_dict(),
-			'data': self._data_to_db_format(),
+			#'user': self.user.to_db_dict(),
+			#'data': self._data_to_db_format(),
 		}
+
+		return self._fields_to_db_dict(db_dict)
+
+	def _fields_to_db_dict(self, db_dict):
+		for field in self._fields:
+			field.field_to_db(self, db_dict)
+
+		return db_dict
+
 
 	def _data_to_db_format(self):
 		return {}
@@ -165,6 +301,80 @@ class DBItem(object):
 			return DBItem.SUBCLASSES[db_dict['type']](db_dict, ws)
 
 
+# class User(object):
+# 	def __init__(self, user_json_object):
+# 		self.user_id = user_json_object['id'].split('-')[0]
+# 		self.name = user_json_object['name']
+
+# 	def to_db_dict(self):
+# 		return {
+# 			'id': self.user_id,
+# 			'name': self.name
+# 		}
+
+# 	@staticmethod
+# 	def from_db_dict(db_dict, ws=None):
+# 		return User({'id': db_dict['id']+'-', 'name': db_dict['name']})
+
+# 	def __str__(self):
+# 		return self.name
+
+# class YoutubeInfo(object):
+
+# 	@staticmethod
+# 	def get_from_url(youtube_url):
+# 		info_url = 'http://gdata.youtube.com/feeds/api/videos/{}?alt=json'
+# 		query = urlparse(youtube_url).query
+# 		youtube_id = parse_qs(query)['v'][0]
+# 		url = info_url.format(youtube_id)
+# 		resp = requests.get(url)
+# 		youtube_info = resp.json()['entry']
+# 		return YoutubeInfo(
+# 			youtube_url,
+# 			youtube_info['title']['$t'],
+# 			youtube_info['content']['$t'],
+# 			youtube_info['media$group']['media$thumbnail'],
+# 			youtube_info['media$group']['yt$duration'])
+
+# 	def __init__(self, url, title, sub_title, thumbnails, duration):
+# 		self.url = url
+# 		self.title = title
+# 		self.sub_title = sub_title
+# 		self.thumbnails = thumbnails
+# 		self.duration = duration
+
+# 	def time_seconds(self):
+# 		assert(len(self.duration.keys()) == 1)
+# 		return int(self.duration['seconds'])
+
+# 	def time_string(self):
+# 		return str(timedelta(seconds=self.time_seconds()))
+
+# 	def select_thumbnail(self):
+# 		return self.thumbnails[0]['url']
+
+# 	def to_db_dict(self):
+# 		return {
+# 			'url': self.url,
+# 			'title': self.title,
+# 			'sub_title': self.sub_title,
+# 			'thumbnails': self.thumbnails,
+# 			'duration': self.duration,
+# 		}
+
+# 	@staticmethod
+# 	def from_db_dict(db_dict, ws=None):
+# 		return YoutubeInfo(
+# 			db_dict['url'],
+# 			db_dict['title'],
+# 			db_dict['sub_title'],
+# 			db_dict['thumbnails'],
+# 			db_dict['duration']
+# 			)
+
+# 	def __str__(self):
+# 		return '{} [{}]'.format(self.title, self.time_string())
+
 class Event(DBItem):
 	DB_TAG = 'database_event'
 	EVENT_TEXT = ''
@@ -172,18 +382,18 @@ class Event(DBItem):
 	def __init__(self, message_or_db, ws):
 		super(Event, self).__init__(message_or_db)
 		self.ws = ws
-		self.is_prepared = True
+		#self.is_prepared = True
 		if not isinstance(message_or_db, Message):
 			self.data = message_or_db['data']
 		else:
 			self.data = message_or_db.data['content']
-			self._process_data()
+			#self._process_data()
 
-	def _process_data(self):
-		pass
+	#def _process_data(self):
+	#	pass
 
-	def prepare(self):
-		pass
+	#def prepare(self):
+	#	pass
 
 	def remaining_duration(self):
 		now = datetime.utcnow()
@@ -211,36 +421,37 @@ class PlayEvent(Event):
 	DB_TAG = 'database_event_play'
 	EVENT_TEXT = '!play'
 
+	CLASS_FIELDS = [YoutubeInfo]
+
 	def __init__(self, message_or_db, ws):
+		self.add_fields(self, PlayEvent.CLASS_FIELDS)
 		super(PlayEvent, self).__init__(message_or_db, ws)
-		if not isinstance(message_or_db, Message):
-			self.youtube_info = YoutubeInfo.from_db_dict(message_or_db['data'])
-			self.data = self.youtube_info.url
-		else:
-			self.youtube_info = None
-			self.data = message_or_db.data['content']
-			self._process_data()
+		#if not isinstance(message_or_db, Message):
+			#self.youtube_info = YoutubeInfo.from_db_dict(message_or_db['data'])
+			#self.data = self.youtube_info.url
+		#else:
+			#self.youtube_info = None
+			#self.data = message_or_db.data['content']
+			#self._process_data()
 
-	def _process_data(self):
-		self.is_prepared = False
-		sstring = '{}\s*([^\s]+)\s?'.format(self.EVENT_TEXT)
-		results = re.search(sstring, self.data)
-		self.data = results.group(1)
+	# def _process_data(self):
+	# 	self.is_prepared = False
+	# 	sstring = '{}\s*([^\s]+)\s?'.format(self.EVENT_TEXT)
+	# 	results = re.search(sstring, self.data)
+	# 	self.data = results.group(1)
 
-	def prepare(self):
-		self.youtube_info = YoutubeInfo.get_from_url(self.data)
-		self.is_prepared = True
+	# def prepare(self):
+	# 	self.youtube_info = YoutubeInfo.get_from_url(self.data)
+	# 	self.is_prepared = True
 
 	def get_duration(self):
-		if self.youtube_info:
-			return timedelta(seconds=(self.youtube_info.time_seconds() + 10))
-		return timedelta(seconds=0)
+		return timedelta(seconds=(self.youtube_info.time_seconds() + 10))
 
-	def _data_to_db_format(self):
-		return self.youtube_info.to_db_dict()
+	#def _data_to_db_format(self):
+	#	return self.youtube_info.to_db_dict()
 
 	def __str__(self):
-		return '[Event] {} {} ({})'.format(self.EVENT_TEXT, self.data, 'playing' if self.is_active() else 'finished')
+		return '[Event] {} {} ({})'.format(self.EVENT_TEXT, self.youtube_info, 'playing' if self.is_active() else 'finished')
 
 
 class Action(object):
@@ -585,32 +796,40 @@ class Command(DBItem):
 	COMMAND = ''
 	COMMAND_LOCATION = 'any'
 
-	def __init__(self, message_or_db, ws):
+	CLASS_FIELDS = [Parent]
+
+	def __init__(self, message_or_db, ws, executed=True):
+		self.add_fields(self, Command.CLASS_FIELDS)
 		super(Command, self).__init__(message_or_db)
 		self.ws = ws
-		self.is_prepared = True
+		#self.is_prepared = True
 		if not isinstance(message_or_db, Message):
-			self.parent_id = message_or_db['data']['parent_id']
-			self.data = {}
+			#self.parent_id = message_or_db['data']['parent_id']
+			#self.data = {}
 			self.executed = message_or_db['data']['executed']
 		else:
-			self.executed = True
-			self.parent_id = message_or_db.data['id']
-			self.data = message_or_db.data['content']
-			self._process_data()
+			self.executed = executed
+			#self.parent_id = message_or_db.data['id']
+			#self.data = message_or_db.data['content']
+			#self._process_data()
 
-	def _data_to_db_format(self):
-		base = super(Command, self)._data_to_db_format()
-		base['parent_id'] = self.parent_id
+	#def _data_to_db_format(self):
+	#	base = super(Command, self)._data_to_db_format()
+	#	base['parent_id'] = self.parent_id
+	#	base['executed'] = self.executed
+
+	#	return base
+
+	def to_db_dict(self):
+		base = super(Command, self).to_db_dict()
 		base['executed'] = self.executed
-
 		return base
 
-	def _process_data(self):
-		pass
+	#def _process_data(self):
+	#	pass
 
-	def prepare(self):
-		pass
+	#def prepare(self):
+	#	pass
 
 	def get_actions(self):
 		return []
@@ -636,25 +855,28 @@ class QueueCommand(Command):
 	COMMAND = '!queue'
 	COMMAND_LOCATION = 'start'
 
+	CLASS_FIELDS = [YoutubeInfo]
+
 	def __init__(self, message_or_db, ws):
+		self.add_fields(self, QueueCommand.CLASS_FIELDS)
 		super(QueueCommand, self).__init__(message_or_db, ws)
-		if not isinstance(message_or_db, Message):
-			self.youtube_info = YoutubeInfo.from_db_dict(message_or_db['data']['youtube_info'])
-			self.data = self.youtube_info.url
-			self.is_prepared = True
-		else:
-			self.youtube_info = None
+		#if not isinstance(message_or_db, Message):
+			#self.youtube_info = YoutubeInfo.from_db_dict(message_or_db['data']['youtube_info'])
+			#self.data = self.youtube_info.url
+			#self.is_prepared = True
+		#else:
+			#self.youtube_info = None
 
-	def _process_data(self):
-		self.is_prepared = False
-		self.executed = False
-		sstring = '{}\s*([^\s]+)\s?'.format(self.COMMAND)
-		results = re.search(sstring, self.data)
-		self.data = results.group(1)
+	# def _process_data(self):
+	# 	self.is_prepared = False
+	# 	self.executed = False
+	# 	sstring = '{}\s*([^\s]+)\s?'.format(self.COMMAND)
+	# 	results = re.search(sstring, self.data)
+	# 	self.data = results.group(1)
 
-	def prepare(self):
-		self.youtube_info = YoutubeInfo.get_from_url(self.data)
-		self.is_prepared = True
+	# def prepare(self):
+	# 	self.youtube_info = YoutubeInfo.get_from_url(self.data)
+	# 	self.is_prepared = True
 
 	def _generate_confirmation_text(self):
 		return 'Added to queue: {}'.format(self.youtube_info)
@@ -662,18 +884,18 @@ class QueueCommand(Command):
 	def get_actions(self):
 		return [ReplyAction(self.ws, self._generate_confirmation_text(), self.parent_id)]
 
-	def _data_to_db_format(self):
-		base = super(QueueCommand, self)._data_to_db_format()
-		base['youtube_info'] = self.youtube_info.to_db_dict()
+	# def _data_to_db_format(self):
+	# 	base = super(QueueCommand, self)._data_to_db_format()
+	# 	base['youtube_info'] = self.youtube_info.to_db_dict()
 
-		return base
+	# 	return base
 
 	@classmethod
 	def help_string(cls):
 		return "{} <youtube url> : Add a song to the queue. Does not support any link shorterners (youtube's included). Songs will be played in order.".format(cls.COMMAND)
 
 	def __str__(self):
-		return '[QueueCommand] {}'.format(self.data)
+		return '[QueueCommand] {}'.format(self.youtube_info)
 
 class ClearQueueCommand(Command):
 	DB_TAG = 'database_command_clearqueue'
@@ -858,12 +1080,12 @@ def message_task():
 			continue
 		command = create_command(message)
 		if command:
-			print('Command:{}'.format(message.data['content']))
+			print('Command:{}'.format(command))
 			yield from command_queue.put(command)
 		else:
 			event = create_event(message)
 			if event:
-				print('Event:{}'.format(message.data['content']))
+				print('Event:{}'.format(event))
 				yield from event_queue.put(event)
 		
 
@@ -871,10 +1093,10 @@ def message_task():
 def command_task():
 	while True:
 		command = yield from command_queue.get()
-		if command.is_prepared:
+		if command.is_prepared():
 			yield from database_queue.put(command.to_db_dict())
-			for action in command.get_actions():
-				yield from action_queue.put(action)
+			#for action in command.get_actions():
+			#	yield from action_queue.put(action)
 		else:
 			yield from prep_queue.put(command)
 
@@ -882,8 +1104,10 @@ def command_task():
 def event_task():
 	while True:
 		event = yield from event_queue.get()
-		if event.is_prepared:
-			yield from database_queue.put(event.to_db_dict())
+		if event.is_prepared():
+			db_dict = event.to_db_dict()
+			#print("adding to database: ", db_dict)
+			yield from database_queue.put(db_dict)
 		else:
 			yield from prep_queue.put(event)
 
@@ -892,10 +1116,14 @@ def prep_task():
 	while True:
 		prep_item = yield from prep_queue.get()
 		try:
+			print("preparing: ", prep_item)
 			prep_item.prepare()
 		except:
 			print('Failed to process: {}'.format(prep_item))
 			continue
+		if not prep_item.is_prepared():
+			print('{} was not prepared after calling prepare()!'.format(prep_item))
+			assert(False)
 		if Command.DB_TAG in prep_item.DB_TAG:
 			yield from command_queue.put(prep_item)
 		elif Event.DB_TAG in prep_item.DB_TAG:
@@ -904,23 +1132,15 @@ def prep_task():
 
 @asyncio.coroutine
 def loop():
-	ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
-	yield from action_queue.put(SetNickAction(ws, "♬|NeonDJBot"))
-	yield from action_queue.put(DebugListCurrentSong(ws))
-	yield from action_queue.put(DebugListQueue(ws))
-	yield from action_queue.put(PlayNextSong(ws))
+	#ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
+	ws = yield from websockets.connect('ws://localhost:8765/')
+	#yield from action_queue.put(SetNickAction(ws, "NeonDJBot"))
+	#yield from action_queue.put(DebugListCurrentSong(ws))
+	#yield from action_queue.put(DebugListQueue(ws))
+	#yield from action_queue.put(PlayNextSong(ws))
 
 	while True:
-		while True:
-			try:
-				packet = yield from ws.recv()
-				break
-			except:
-				try:
-					ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
-				except:
-					continue
-
+		packet = yield from ws.recv()
 		packet = Packet(ws, packet)
 
 		if packet.type == 'ping-event':
