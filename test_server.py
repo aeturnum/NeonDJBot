@@ -7,7 +7,7 @@ def loop(websocket, path):
 	line = f.readline()
 	while line != '':
 		yield from websocket.send(line.strip())
-		yield from asyncio.sleep(1)
+		yield from asyncio.sleep(.1)
 		line = f.readline()
 
 start_server = websockets.serve(loop, 'localhost', 8765)
