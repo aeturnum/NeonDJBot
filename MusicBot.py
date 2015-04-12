@@ -12,9 +12,8 @@ from urllib.parse import parse_qs, urlparse
 from tinydb import TinyDB, where
 
 class Message(object):
-	def __init__(self, ws, data, past=False):
+	def __init__(self, data, past=False):
 		self.data = data
-		self.ws = ws
 		self.past = past
 
 		if 'time' in self.data:
@@ -22,7 +21,7 @@ class Message(object):
 			self.uid = self.data['id']
 
 class Packet(object):
-	def __init__(self, ws, packet):
+	def __init__(self, packet):
 		packet = json.loads(packet)
 		self.timestamp = int(time())
 		if 'type' in packet:
@@ -35,13 +34,12 @@ class Packet(object):
 				self.timestamp = int(self.data['time'])
 		else:
 			self.data = packet
-		self.ws = ws
 
 	def messages(self):
 		if self.type == 'send-event' or self.type == 'send-reply':
-			return [Message(self.ws, self.data)]
+			return [Message(self.data)]
 		elif self.type == 'snapshot-event':
-			return [Message(self.ws, m, past=True) for m in self.data['log']]
+			return [Message(m, past=True) for m in self.data['log']]
 
 		return []
 
@@ -117,7 +115,7 @@ class User(DBField):
 	@classmethod
 	def create_from_message(cls, message):
 		sender = message.data['sender']
-		return User(sender['id'].split('-')[0], sender['name'])	
+		return User(sender['id'].split(':')[1], sender['name'])	
 
 	@classmethod
 	def create_from_db_dict(cls, db_dict):
@@ -133,6 +131,9 @@ class User(DBField):
 		super(User, self).__init__()
 		self.user_id = user_id
 		self.name = name
+
+	def display(self):
+		return self.name
 
 	def __str__(self):
 		return self.name
@@ -226,7 +227,7 @@ class YoutubeInfo(DBField):
 		return False
 
 	def display(self):
-		return '{} [{}]'.format(self.title, self.time_string())
+		return '{}'.format(self.title)
 
 	def __repr__(self):
 		return str(self)
@@ -302,9 +303,9 @@ class DBItem(object):
 			return self.uid == other.uid
 
 	@staticmethod
-	def create_object_from_db_entry(db_dict, ws=None):
+	def create_object_from_db_entry(db_dict):
 		if db_dict['type'] in DBItem.SUBCLASSES:
-			return DBItem.SUBCLASSES[db_dict['type']](db_dict, ws)
+			return DBItem.SUBCLASSES[db_dict['type']](db_dict)
 
 
 class Task(DBItem):
@@ -318,7 +319,7 @@ class Task(DBItem):
 			fake_db_dict[field.FIELD_NAME] = field.to_db_dict()
 		return cls(fake_db_dict)
 
-	def __init__(self, message_or_db, ws = None):
+	def __init__(self, message_or_db):
 		super(Task, self).__init__(message_or_db)
 
 	def satisfied_by_event(self, state, event):
@@ -354,9 +355,9 @@ class PlaySongTask(Task):
 
 	CLASS_FIELDS = [YoutubeInfo]
 
-	def __init__(self, message_or_db, ws = None):
+	def __init__(self, message_or_db):
 		self.add_fields(self, PlaySongTask.CLASS_FIELDS)
-		super(PlaySongTask, self).__init__(message_or_db, ws)
+		super(PlaySongTask, self).__init__(message_or_db)
 
 	def process_event(self, state, event):
 		if event.DB_TAG == PlayEvent.DB_TAG:
@@ -372,10 +373,6 @@ class PlaySongTask(Task):
 class Event(DBItem):
 	DB_TAG = 'database_event'
 	EVENT_TEXT = ''
-
-	def __init__(self, message_or_db, ws):
-		super(Event, self).__init__(message_or_db)
-		self.ws = ws
 
 	def remaining_duration(self):
 		now = datetime.utcnow()
@@ -408,9 +405,9 @@ class PlayEvent(Event):
 
 	CLASS_FIELDS = [YoutubeInfo]
 
-	def __init__(self, message_or_db, ws):
+	def __init__(self, message_or_db):
 		self.add_fields(self, PlayEvent.CLASS_FIELDS)
-		super(PlayEvent, self).__init__(message_or_db, ws)
+		super(PlayEvent, self).__init__(message_or_db)
 
 	def get_duration(self):
 		return timedelta(seconds=(self.youtube_info.time_seconds() + 5))
@@ -423,57 +420,105 @@ class PlayEvent(Event):
 
 
 class Action(object):
-	def __init__(self, ws):
-		self.ws = ws
+	START_DELAY = 0
+	LOOP_DELAY = 0.2
+	MESSAGE_DELAY = 0
+
+	def __init__(self):
+		self.ws = None
 		self.timestamp = int(time())
-		self.delay = timedelta(seconds=0) 
 
-	def process_state(self, state):
-		pass
-
-	def get_packet_to_send(self, id):
+	def packet_to_send(self, state):
 		return None
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def nop():
-			return
-		return nop
+	def actions_to_queue(self, state):
+		return []
 
-class ReplyAction(Action):
-	def __init__(self, ws, text, reply_to):
-		super(ReplyAction, self).__init__(ws)
+	def should_repeat(self, state):
+		return False
+
+	def get_coroutine(self, state, id_generator, action_queue):
+		@asyncio.coroutine
+		def task():
+			yield from asyncio.sleep(self.START_DELAY)
+
+			while True:
+				message = self.packet_to_send(state)
+				if message:
+					# set id
+					message['id'] = str(next(id_generator))
+					try:
+						yield from self.ws.send(json.dumps(message))
+					except InvalidState:
+						# websocket closed
+						yield from action_queue.put(self)
+						break
+					except TypeError:
+						print('{} - Failed to send: {}'.format(self, json.dumps(message)))
+						break # bail the hell out
+					yield from asyncio.sleep(self.MESSAGE_DELAY)
+				for action in self.actions_to_queue(state):
+					yield from action_queue.put(action)
+
+				if not self.should_repeat(state):
+					break
+				else:
+					yield from asyncio.sleep(self.LOOP_DELAY)
+
+		return task
+
+
+class PacketAction(Action):
+
+	@staticmethod
+	def _wrap(p_type, data):
+		return {"type":p_type,"data":data}
+
+	@classmethod
+	def ping_packet(cls, timestamp):
+		return cls._wrap('ping-reply', {"time":timestamp})
+
+	@classmethod
+	def send_packet(cls, text, parent_message):
+		return cls._wrap('send', {"content":text,"parent":parent_message})
+
+	@classmethod
+	def nick_packet(cls, nick):
+		return cls._wrap('nick', {"name":nick})
+
+class PingAction(PacketAction):
+	def __init__(self):
+		super(PingAction, self).__init__()
+
+	def packet_to_send(self, state):
+		return self.ping_packet(self.timestamp)
+
+class ReplyAction(PacketAction):
+	def __init__(self, text, reply_to = ''):
+		super(ReplyAction, self).__init__()
 		self.text = text
 		self.reply_to = reply_to
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def reply():
-			m = {"type":"send","data":{"content":self.text,"parent":self.reply_to},"id":str(next(id_generator))}
-			yield from self.ws.send(json.dumps(m))
+	def packet_to_send(self, state):
+		return self.send_packet(self.text, self.reply_to)
 
-		return reply
 
-	def __str__(self):
-		return 'ReplyAction -> {}'.format(self.text)
+class SetNickAction(PacketAction):
+	def __init__(self, nick):
+		super(SetNickAction, self).__init__()
+		self.nick = nick
 
-class SongAction(Action):
-	@staticmethod
-	def set_executed():
-	    """
-	    Increment a given field in the element.
-	    """
-	    def transform(element):
-	        element['executed'] = True
+	def packet_to_send(self, state):
+		return self.nick_packet(self.nick)
 
-	    return transform
 
+class SongAction(PacketAction):
 	def currently_playing(self, db):
 		events = db.search(where('type') == PlayEvent.DB_TAG)
 		if events:
 			events = sorted(events, key=lambda x: x['timestamp'])
 			if len(events):
-				event = DBItem.create_object_from_db_entry(events[-1], self.ws) 
+				event = DBItem.create_object_from_db_entry(events[-1]) 
 				if event.is_active():
 					return event
 		return None
@@ -485,253 +530,200 @@ class SongAction(Action):
 		queued_songs = db.search(where('type') == PlaySongTask.DB_TAG)
 		if queued_songs:
 			queued_songs = sorted(queued_songs, key=lambda x: x['timestamp'])
-			return [DBItem.create_object_from_db_entry(song, self.ws) for song in queued_songs]
+			return [DBItem.create_object_from_db_entry(song) for song in queued_songs]
 
 		return []
-
-	def get_next_if_nothing_playing(self, db):
-		currently_playing = self.currently_playing(db)
-		if currently_playing:
-			return None
-		else:
-			return self.pop_queue(db)
-
-	def pop_queue(self, db):
-		queue = self.queued_songs(db)
-		if queue and len(queue) > 0:
-			command = queue[0]
-			#db.update({'state':Task.STATE_EXPIRED}, where('type') == PlaySongTask.DB_TAG and where('uid') == command.uid)
-			return command
-		else:
-			return None
 
 	def skip_count(self, db, seconds):
 		now = int(time())
 		return db.search((where('type') == SkipCommand.DB_TAG) & (where('timestamp') > (now - seconds)) ) 
 
-	def skip_current(self, db):
-		currently_playing = self.currently_playing(db)
-		if not currently_playing:
-			return None
-		else:
-			return self.pop_queue(db)
+class QueuedNotificationAction(SongAction):
+	def __init__(self, song_info, reply_to = ''):
+		super(QueuedNotificationAction, self).__init__()
+		self.song_info = song_info
+		self.reply_to = reply_to
 
-class SetNickAction(Action):
-	def __init__(self, ws, nick):
-		super(SetNickAction, self).__init__(ws)
-		self.nick = nick
+	def packet_to_send(self, state):
+		queue = self.queued_songs(state['db'])
+		current_song = self.currently_playing(state['db'])
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def reply():
-			m = {"type":"nick","data":{"name":self.nick},"id":str(next(id_generator))}
-			yield from self.ws.send(json.dumps(m))
+		wait = timedelta(seconds=0)
+		song_string = '"{}" queued'.format(self.song_info.display())
+		wait_str = 'now.'
+		if current_song:
+			wait = timedelta(seconds=current_song.remaining_duration())
+			wait_str = 'in {}'.format(str(wait))
+		text = '{} first and will be played {}'.format(song_string, wait_str)
+		if queue:
+			position = 1
+			for task in queue:
+				if self.reply_to in task.uid:
+					break
+				wait = wait + timedelta(seconds=task.youtube_info.time_seconds())
+				position += 1
 
-		return reply
+			if position > 1:
+				text = '{} at position [{}] and will be played in {}'.format(song_string, position, str(wait))
+
+
+		return self.send_packet(text, self.reply_to)
 
 class ClearQueueAction(SongAction):
-	def process_state(self, state):
+	def should_repeat(self, state):
 		self.clear_queue(state['db'])
-		# queue = self.queued_songs(state['db'])
-		# for command in queue:
-		# 	db.remove(self.set_executed(), where('type') == QueueCommand.DB_TAG and where('uid') == command.uid)
+
+		return False
 
 	def __str__(self):
 		return 'ClearQueue'
 
+class PlayQueuedSongAction(SongAction):
+	def __init__(self, reply_to=''):
+		super(PlayQueuedSongAction, self).__init__()
+		self.reply_to = reply_to
 
-class PlayNextSong(SongAction):
-	FIRST_PASS = True
+	@classmethod
+	def song_message(cls, play_song_task):
+		return '{} (from {})'.format(
+			play_song_task.youtube_info.display(),
+			play_song_task.user.display())
 
-	def process_state(self, state):
-		self.next_song = None
-		self.song_after = None
-		if not self.currently_playing(state['db']):
-			queue = self.queued_songs(state['db'])
-			if len(queue) > 0:
-				self.next_song = queue[0]
-			if len(queue) > 1:
-				self.song_after = queue[1]
+	@classmethod
+	def play_message(cls, song_to_play, next_song=None):
+		next = 'Nothing'
+		if next_song:
+			next = cls.song_message(next_song)
+		return '{}\n!play {}\nNext: {}'.format(
+			cls.song_message(song_to_play),
+			song_to_play.youtube_info.url,
+			next)
 
-	def get_message(self):
-		song_after = 'Nothing' if self.song_after == None else '{} (from {})'.format(
-			self.song_after.youtube_info.display(),
-			self.song_after.user
-			)
-		return 'Playing: {} (from {})\n!play {}\nNext: {}'.format(
-				self.next_song.youtube_info.display(),
-				self.next_song.user,
-				self.next_song.youtube_info.url,
-				song_after)
+	def get_song_to_play(self, state):
+		return None, None
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def play_and_repeat():
-			if self.FIRST_PASS:
-				yield from asyncio.sleep(5)
-				self.FIRST_PASS = False
-			
-			if self.next_song:
-				print("playing {}".format(self.next_song.youtube_info))
-				yield from action_queue.put(ReplyAction(self.ws, self.get_message(), ''))
-				yield from asyncio.sleep(1)
+	def packet_to_send(self, state):
+		(song_to_play, next_song) = self.get_song_to_play(state)
+		if song_to_play:
+			return self.send_packet(
+				self.play_message(song_to_play, next_song),
+				self.reply_to)
+		return None
 
-			yield from asyncio.sleep(0.1)
-			yield from action_queue.put(self)
+class PlayNextQueuedSongAction(PlayQueuedSongAction):
+	START_DELAY = 5
+	MESSAGE_DELAY = 2
 
-		return play_and_repeat
+	def get_song_to_play(self, state):
+		db = state['db']
+		if not self.currently_playing(db):
+			q = self.queued_songs(db)
+			return q[0] if len(q) > 0 else None, q[1] if len(q) > 1 else None
 
-class SkipSongAction(SongAction):
-	FIRST_PASS = True
+		return None, None
 
-	def process_state(self, state):
-		self.next_song = None
-		self.song_after = None
-		if self.currently_playing(state['db']):
-			queue = self.queued_songs(state['db'])
-			if len(queue) > 0:
-				self.next_song = queue[0]
-			if len(queue) > 1:
-				self.song_after = queue[1]
+	def should_repeat(self, state):
+		return True
 
-	def get_message(self):
-		song_after = 'Nothing' if self.song_after == None else '{} (from {})'.format(
-			self.song_after.youtube_info.display(),
-			self.song_after.user
-			)
-		return 'Playing: {} (from {})\n!play {}\nNext: {}'.format(
-				self.next_song.youtube_info.display(),
-				self.next_song.user,
-				self.next_song.youtube_info.url,
-				song_after)
+class SkipCurrentSongAction(PlayQueuedSongAction):
+	def get_song_to_play(self, state):
+		db = state['db']
+		if self.currently_playing(db):
+			q = self.queued_songs(db)
+			return q[0] if len(q) > 0 else None, q[1] if len(q) > 1 else None
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def skip():			
-			if self.next_song:
-				print("Skipping to {}".format(self.next_song.youtube_info))
-				yield from action_queue.put(ReplyAction(self.ws, self.get_message(), ''))
-				yield from asyncio.sleep(1)
-
-		return skip
+		return None, None
 
 class VoteSkipAction(SongAction):
+
+	def should_repeat(self, state):
+		print('skip count:', self.skip_count(state['db'], 60*60))
+		return False
 
 	def process_state(self, state):
 		print('skip count:', self.skip_count(state['db'], 60*60))
 
 
 class DebugListCurrentSong(SongAction):
-	def process_state(self, state):
+	LOOP_DELAY = 5
+
+	def __init__(self):
+		super(DebugListCurrentSong, self).__init__()
+		self.previous_song = None
+
+	def should_repeat(self, state):
 		current_song = self.currently_playing(state['db'])
 		if current_song:
 			if current_song.remaining_duration() < 20:
 				print("Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
-		if not hasattr(self, 'current_song'):
-			self.current_song = current_song
-			if current_song:
-				print("Song change: Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
-		else:
-			if self.current_song != current_song:
-				self.current_song = current_song
-				if current_song:
-					print("Song change: Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def wait_and_repeat():
-			yield from asyncio.sleep(5)
-			yield from action_queue.put(self)
-		return wait_and_repeat
+		if current_song != self.previous_song:
+			print("Song change: {} -> {}".format(self.previous_song, current_song))
+
+		self.previous_song = current_song
+
+		return True
 
 class DumpQueue(SongAction):
-	def __init__(self, ws, reply_to):
-		super(DumpQueue, self).__init__(ws)
+	def __init__(self, reply_to=''):
+		super(DumpQueue, self).__init__()
 		self.reply_to = reply_to
 
-	def process_state(self, state):
+	def packet_to_send(self, state):
 		song_queue = self.queued_songs(state['db'])
+		message = 'Nothing Queued'
 		if song_queue:
-			self.song_queue = ['{} added by @{}\n command(copy & paste w/ !): play {}'.format(str(song.youtube_info.display()), song.user.name, str(song.youtube_info.url)) for song in song_queue]
-		else:
-			self.song_queue = None
+			strings = []
+			for song in song_queue:
+				strings.append('{} added by @{}\n command(copy & paste w/ !): play {}'.format(str(song.youtube_info.display()), song.user.name, str(song.youtube_info.url)))
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def wait_and_repeat():
+			return self.send_packet('\n'.join(strings), self.reply_to)
 
-			if self.song_queue:
-				text = '\n'.join(self.song_queue)
-			else:
-				text = 'Nothing Queued'
-			m = {"type":"send","data":{"content":text,"parent":self.reply_to},"id":str(next(id_generator))}
-			yield from self.ws.send(json.dumps(m))
-			yield from action_queue.put(ClearQueueAction(self.ws))
-
-		return wait_and_repeat
+		return self.send_packet(message, self.reply_to)
 
 class ListQueue(SongAction):
-	def __init__(self, ws, reply_to):
-		super(ListQueue, self).__init__(ws)
+	def __init__(self, reply_to):
+		super(ListQueue, self).__init__()
 		self.reply_to = reply_to
 
-	def process_state(self, state):
+	def packet_to_send(self, state):
 		song_queue = self.queued_songs(state['db'])
+		current_song = self.currently_playing(state['db'])
+		message = 'Nothing Queued'
 		if song_queue:
-			self.song_queue = ['{} added by {}'.format(str(song.youtube_info.display()), song.user.name) for song in song_queue]
-		else:
-			self.song_queue = None
+			strings = []
+			place = 1
+			total_duration = timedelta(seconds=current_song.remaining_duration())
+			for song in song_queue:
+				strings.append('[{}] {} added by {} Starts in [{}]'.format(
+					place,
+					str(song.youtube_info.display()),
+					song.user.name,
+					str(total_duration))
+				)
+				place += 1
+				total_duration = total_duration + timedelta(seconds=song.youtube_info.time_seconds())
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def wait_and_repeat():
+			return self.send_packet('\n'.join(strings), self.reply_to)
 
-			if self.song_queue:
-				text = '\n'.join(self.song_queue)
-			else:
-				text = 'Nothing Queued'
-			m = {"type":"send","data":{"content":text,"parent":self.reply_to},"id":str(next(id_generator))}
-			yield from self.ws.send(json.dumps(m))
-
-		return wait_and_repeat
+		return self.send_packet(message, self.reply_to)
 
 class DebugListQueue(SongAction):
-	def process_state(self, state):
-		song_queue = self.queued_songs(state['db'])
-		if song_queue:
-			song_queue = ['{} added by {}'.format(str(song.youtube_info), song.user.name) for song in song_queue]
-		if not hasattr(self, 'song_queue'):
-			self.song_queue = song_queue
-			print("Current queue:{}".format(song_queue))
-		else:
-			if len(self.song_queue) != len(song_queue):
-				self.song_queue = song_queue
-				print("Current queue:{}".format(song_queue))
+	def __init__(self):
+		super(DebugListQueue, self).__init__()
+		self.previous_queue = None
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def wait_and_repeat():
-			yield from asyncio.sleep(0.1)
-			yield from action_queue.put(self)
-		return wait_and_repeat
+	def should_repeat(self, state):
+		queue = self.queued_songs(state['db'])
+		if queue:
+			queue = ['{} added by {}'.format(str(song.youtube_info), song.user.name) for song in queue]
 
+		if self.previous_queue == None or len(self.previous_queue) != len(queue):
+			print("Current queue:{}".format('\n'.join(queue)))
 
-class PingAction(Action):
-	def __init__(self, ws):
-		super(PingAction, self).__init__(ws)
-		self.timestamp = int(time())
+		self.previous_queue = queue
 
-	def get_task(self, id_generator, action_queue):
-		@asyncio.coroutine
-		def ping():
-			m = {"type":"ping-reply","data":{"time":self.timestamp},"id":str(next(id_generator))}
-			yield from self.ws.send(json.dumps(m))
-
-		return ping
-
-
-	def __str__(self):
-		return 'PingAction'
+		return True
 
 
 class Command(DBItem):
@@ -742,10 +734,9 @@ class Command(DBItem):
 
 	CLASS_FIELDS = [Parent]
 
-	def __init__(self, message_or_db, ws):
+	def __init__(self, message_or_db):
 		self.add_fields(self, Command.CLASS_FIELDS)
 		super(Command, self).__init__(message_or_db)
-		self.ws = ws
 
 	def get_actions(self):
 		return []
@@ -779,16 +770,16 @@ class QueueCommand(Command):
 
 	CLASS_FIELDS = [YoutubeInfo]
 
-	def __init__(self, message_or_db, ws):
+	def __init__(self, message_or_db):
 		self.add_fields(self, QueueCommand.CLASS_FIELDS)
-		super(QueueCommand, self).__init__(message_or_db, ws)
+		super(QueueCommand, self).__init__(message_or_db)
 
 	def _generate_confirmation_text(self):
 		return 'Added to queue: {}'.format(self.youtube_info.display())
 
 	def get_actions(self):
-		return [ReplyAction(self.ws, self._generate_confirmation_text(), str(self.parent_id))]
-		#return []
+		#return [ReplyAction(self._generate_confirmation_text(), str(self.parent_id))]
+		return [QueuedNotificationAction(self.youtube_info, str(self.parent_id))]
 
 	def get_tasks(self):
 		return [PlaySongTask.new_task(self.user, self.uid+'_1', self.timestamp, fields=[self.youtube_info])]
@@ -806,8 +797,7 @@ class ClearQueueCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [ClearQueueAction(self.ws)]
-		#return []
+		return [ClearQueueAction()]
 
 class ListQueueCommand(Command):
 	DB_TAG = 'database_command_listqueue'
@@ -815,8 +805,7 @@ class ListQueueCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [ListQueue(self.ws, str(self.parent_id))]
-		#return []
+		return [ListQueue(str(self.parent_id))]
 
 	@classmethod
 	def help_string(cls):
@@ -828,7 +817,7 @@ class DumpQueueCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [DumpQueue(self.ws, str(self.parent_id))]
+		return [DumpQueue(str(self.parent_id))]
 
 	@classmethod
 	def help_string(cls):
@@ -840,7 +829,7 @@ class SkipCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [SkipSongAction(self.ws)]
+		return [SkipCurrentSongAction()]
 
 	@classmethod
 	def help_string(cls):
@@ -852,7 +841,7 @@ class TestSkipCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [VoteSkipAction(self.ws)]
+		return [VoteSkipAction()]
 
 class NeonLightShowCommand(Command):
 	DB_TAG = 'database_command_neonlightshow'
@@ -861,7 +850,7 @@ class NeonLightShowCommand(Command):
 
 	def get_actions(self):
 		images = ['http://i.imgur.com/eBZO67G.gif', 'http://i.imgur.com/0bprD6k.gif', 'http://i.imgur.com/van2j15.gif', 'http://i.imgur.com/sYjX7Qv.gif']
-		return [ReplyAction(self.ws, random.choice(images), str(self.parent_id))]
+		return [ReplyAction(random.choice(images), str(self.parent_id))]
 
 
 class HelpCommand(Command):
@@ -885,8 +874,7 @@ class HelpCommand(Command):
 
 	def get_actions(self):
 		if self.get_help_lines():
-			return [ReplyAction(self.ws, self.get_help_lines(), str(self.parent_id))]
-			#return []
+			return [ReplyAction(self.get_help_lines(), str(self.parent_id))]
 
 
 DBItem.SUBCLASSES.update({
@@ -932,7 +920,7 @@ def create_db_object(packet):
 	for event_class in db_objects:
 		if event_class.is_this(content):
 			try:
-				return event_class(packet, packet.ws)
+				return event_class(packet)
 			except:
 				print('failed to create: {}'.format(packet.data))
 	return None
@@ -952,6 +940,8 @@ command_action_queue = asyncio.JoinableQueue()
 database_queue = asyncio.JoinableQueue()
 task_queue = asyncio.JoinableQueue()
 
+websocket_queue = asyncio.JoinableQueue()
+
 state = {
 	'db': db
 }
@@ -966,22 +956,26 @@ def database_task():
 
 		database_queue.task_done()
 
+
 @asyncio.coroutine
 def cull_tasks_and_add_to_db():
 	global state
 	while True:
 		task = yield from task_queue.get()
-		yield from message_queue.join() # process all messages
+		#yield from message_queue.join() # process all messages
 		yield from database_queue.join() # process all db inserts
 		events = state['db'].search( where('type').contains(Event.DB_TAG) & (where('timestamp') > task.timestamp)) 
 		events = [DBItem.create_object_from_db_entry(event, None) for event in events]
+		#print('Checking Task: {}'.format(task))
 		satisfied = False
 		for event in events:
 			if task.satisfied_by_event(state, event):
+				#print('{} satisfied by {}'.format(task, event))
 				for action in task.get_actions():
 					yield from action_queue.put(action)
 
 				satisfied = True
+				break
 		if not satisfied:
 			yield from database_queue.put(task.to_db_dict())
 
@@ -998,10 +992,19 @@ def execute_actions_task():
 	id_gen = mid()
 	while True:
 		action = yield from action_queue.get()
+
+		# set websocket
+		current_ws = yield from websocket_queue.get()
+		if not websocket_queue.empty():
+			print('got websocket, but queue is not empty!')
+		action.ws = current_ws
+		yield from websocket_queue.put(current_ws)
+		websocket_queue.task_done()
+
 		#print('processing action: {}'.format(action))
-		action.process_state(state)
-		task = action.get_task(id_gen, action_queue)
+		task = action.get_coroutine(state,  id_gen, action_queue)
 		asyncio.Task(task())
+
 		action_queue.task_done()
 
 
@@ -1016,7 +1019,6 @@ def queue_command_tasks():
 				continue
 			
 			yield from task_queue.put(task)
-
 		command_task_queue.task_done()
 		
 
@@ -1045,9 +1047,12 @@ def parse_messages():
 			#print('Adding to DB: {}'.format(db_object))
 			if Event.DB_TAG in db_object.DB_TAG:
 				tasks = db.search(where('type').contains(Task.DB_TAG))
-				tasks = [DBItem.create_object_from_db_entry(task, db_object.ws) for task in tasks]
+				tasks = [DBItem.create_object_from_db_entry(task) for task in tasks]
+				#print('Checking Event: {}'.format(db_object))
+				#print('Current Tasks: {}'.format(tasks))
 				for task in tasks:
 					if task.satisfied_by_event(state, db_object):
+						#print('{} satisfied by {}'.format(task, db_object))
 						for action in task.get_actions():
 							yield from action_queue.put(action)
 						break
@@ -1055,13 +1060,14 @@ def parse_messages():
 			yield from database_queue.put(db_object.to_db_dict())
 
 			if Command.DB_TAG in db_object.DB_TAG:
-				if message.past:
-					print('Adding to task queue: {}'.format(db_object))
-					yield from command_task_queue.put(db_object)
-				else:
-					print('Adding to action queue: {}'.format(db_object))
-					yield from command_action_queue.put(db_object)
 
+				#print('Adding to task queue: {}'.format(db_object))
+				yield from command_task_queue.put(db_object)
+
+				if not message.past:
+					#print('Adding to action queue: {}'.format(db_object))
+					yield from command_action_queue.put(db_object)
+					
 		message_queue.task_done()
 
 @asyncio.coroutine
@@ -1069,9 +1075,9 @@ def queue_command_actions():
 	while True:
 		command = yield from command_action_queue.get()	
 		for action in command.get_actions():
-			print('{} -> {}'.format(command, action))
+			#print('{} -> {}'.format(command, action))
 			yield from action_queue.put(action)
-		yield from command_task_queue.put(command)
+
 		command_action_queue.task_done()
 
 
@@ -1080,26 +1086,35 @@ def queue_command_actions():
 def loop():
 	ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
 	#ws = yield from websockets.connect('ws://localhost:8765/')
-	yield from action_queue.put(SetNickAction(ws, "♬|NeonDJBot"))
-	yield from action_queue.put(DebugListCurrentSong(ws))
-	yield from action_queue.put(DebugListQueue(ws))
-	yield from action_queue.put(PlayNextSong(ws))
+
+	yield from websocket_queue.put(ws)
+
+	yield from action_queue.put(SetNickAction("♬|NeonDJBot"))
+	yield from action_queue.put(DebugListCurrentSong())
+	yield from action_queue.put(DebugListQueue())
+	yield from action_queue.put(PlayNextQueuedSongAction())
 
 	while True:
 		packet = yield from ws.recv()
 		if not packet: #server d/c
+			outdated_ws = yield from websocket_queue.get()
+			if not websocket_queue.empty():
+				print('got websocket, but queue is not empty!')
 			while True:
 				yield from asyncio.sleep(1)
 				try:
 					ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
-					packet = yield from ws.recv()
-					break
 				except:
-					pass
-		packet = Packet(ws, packet)
+					continue
+
+				yield from websocket_queue.put(ws)
+				packet = yield from ws.recv()
+				break
+			websocket_queue.task_done()
+		packet = Packet(packet)
 
 		if packet.type == 'ping-event':
-			yield from action_queue.put(PingAction(ws))
+			yield from action_queue.put(PingAction())
 		else:
 			for message in packet.messages():
 				yield from message_queue.put(message)
