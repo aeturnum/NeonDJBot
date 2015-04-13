@@ -162,7 +162,7 @@ class YoutubeInfo(DBField):
 	@classmethod
 	def create_from_message(cls, message):
 		# returns list of tuples
-		urls = re.findall(cls.REGEX, message.data['content'])
+		urls = re.findall(cls.REGEX, message.data['content'], flags=re.I)
 		return YoutubeInfo(urls[0][0])	
 
 	@classmethod
@@ -227,7 +227,7 @@ class YoutubeInfo(DBField):
 		return False
 
 	def display(self):
-		return '{}'.format(self.title)
+		return '"{}"'.format(self.title)
 
 	def __repr__(self):
 		return str(self)
@@ -410,7 +410,7 @@ class PlayEvent(Event):
 		super(PlayEvent, self).__init__(message_or_db)
 
 	def get_duration(self):
-		return timedelta(seconds=(self.youtube_info.time_seconds() + 5))
+		return timedelta(seconds=(self.youtube_info.time_seconds()) + 6)
 
 	def __repr__(self):
 		return str(self)
@@ -538,6 +538,7 @@ class SongAction(PacketAction):
 		now = int(time())
 		return db.search((where('type') == SkipCommand.DB_TAG) & (where('timestamp') > (now - seconds)) ) 
 
+
 class QueuedNotificationAction(SongAction):
 	def __init__(self, song_info, reply_to = ''):
 		super(QueuedNotificationAction, self).__init__()
@@ -549,7 +550,7 @@ class QueuedNotificationAction(SongAction):
 		current_song = self.currently_playing(state['db'])
 
 		wait = timedelta(seconds=0)
-		song_string = '"{}" queued'.format(self.song_info.display())
+		song_string = '{} queued'.format(self.song_info.display())
 		wait_str = 'now.'
 		if current_song:
 			wait = timedelta(seconds=current_song.remaining_duration())
@@ -656,6 +657,8 @@ class DebugListCurrentSong(SongAction):
 		if current_song:
 			if current_song.remaining_duration() < 20:
 				print("Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
+			elif current_song.remaining_duration() % 20 == 0:
+				print("Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
 
 		if current_song != self.previous_song:
 			print("Song change: {} -> {}".format(self.previous_song, current_song))
@@ -691,16 +694,26 @@ class ListQueue(SongAction):
 		current_song = self.currently_playing(state['db'])
 		message = 'Nothing Queued'
 		if song_queue:
-			strings = []
 			place = 1
 			total_duration = timedelta(seconds=current_song.remaining_duration())
+			max_duration_width = max(len(str(total_duration)),len('wait time'))
+			max_position_width = 1
+			max_song_title_width = len('song title')
 			for song in song_queue:
-				strings.append('[{}] {} added by {} Starts in [{}]'.format(
-					place,
-					str(song.youtube_info.display()),
-					song.user.name,
-					str(total_duration))
+				max_position_width = max(len(str(place)), max_position_width)
+				place += 1
+
+			place = 1
+			time_and_pos_formatting_string = '[{{:^{}}}][{{:^{}}}]'
+			time_format = time_and_pos_formatting_string.format(
+					max_position_width, max_duration_width,
 				)
+			strings = [time_format.format('#', 'wait time')]
+			for song in song_queue:
+				song_string = time_format.format(place, str(total_duration))
+				song_string += ' {} added by [{}]'.format(song.youtube_info.display(), song.user.name)
+				strings.append(song_string)
+
 				place += 1
 				total_duration = total_duration + timedelta(seconds=song.youtube_info.time_seconds())
 
@@ -965,7 +978,7 @@ def cull_tasks_and_add_to_db():
 		#yield from message_queue.join() # process all messages
 		yield from database_queue.join() # process all db inserts
 		events = state['db'].search( where('type').contains(Event.DB_TAG) & (where('timestamp') > task.timestamp)) 
-		events = [DBItem.create_object_from_db_entry(event, None) for event in events]
+		events = [DBItem.create_object_from_db_entry(event) for event in events]
 		#print('Checking Task: {}'.format(task))
 		satisfied = False
 		for event in events:
