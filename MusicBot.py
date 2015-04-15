@@ -321,6 +321,11 @@ class Task(DBItem):
 
 	def __init__(self, message_or_db):
 		super(Task, self).__init__(message_or_db)
+		self.message_queue = asyncio.JoinableQueue()
+
+	@asyncio.coroutine
+	def coroutine(self, action_queue):
+		return
 
 	def satisfied_by_event(self, state, event):
 		db = state['db']
@@ -349,6 +354,23 @@ class Task(DBItem):
 
 	def __str__(self):
 		return '{}:{}'.format(self.DB_TAG, self.satisfied)
+
+class CommandActionTask(object):
+
+	def __init__(self):
+		self.message_queue = asyncio.JoinableQueue()
+
+	@asyncio.coroutine
+	def coroutine(self, action_queue, db):
+		while True:
+			message = yield from self.message_queue.get()
+			print('handling {} actions from'.format(message))
+			if hasattr(message, 'get_actions'):
+				for action in message.get_actions():
+					yield from action_queue.put(action)
+
+			self.message_queue.task_done()
+
 
 class PlaySongTask(Task):
 	DB_TAG = 'database_task_playsong'
@@ -391,6 +413,9 @@ class Event(DBItem):
 
 	def get_duration(self):
 		return timedelta(seconds=0)
+
+	def get_duration_int(self):
+		return self.get_duration().seconds
 
 	@classmethod
 	def is_this(cls, message):
@@ -449,9 +474,8 @@ class Action(object):
 					message['id'] = str(next(id_generator))
 					try:
 						yield from self.ws.send(json.dumps(message))
-					except websockets.exceptions.InvalidState:
+					except InvalidState:
 						# websocket closed
-						print('websocket disconnected, getting new websocket')
 						yield from action_queue.put(self)
 						break
 					except TypeError:
@@ -481,7 +505,8 @@ class PacketAction(Action):
 
 	@classmethod
 	def send_packet(cls, text, parent_message):
-		return cls._wrap('send', {"content":text,"parent":parent_message})
+		print("Send Packet: {}".format(text))
+		#return cls._wrap('send', {"content":text,"parent":parent_message})
 
 	@classmethod
 	def nick_packet(cls, nick):
@@ -635,6 +660,15 @@ class SkipCurrentSongAction(PlayQueuedSongAction):
 			return q[0] if len(q) > 0 else None, q[1] if len(q) > 1 else None
 
 		return None, None
+
+class PlayOneSongAction(PlayQueuedSongAction):
+	def __init__(self, reply_to='', song_one=None, song_two=None):
+		super(PlayOneSongAction, self).__init__(reply_to)
+		self.song_one = song_one
+		self.song_two = song_two
+
+	def get_song_to_play(self, state):
+		return self.song_one, self.song_two
 
 class VoteSkipAction(SongAction):
 
@@ -940,108 +974,285 @@ def create_db_object(packet):
 	return None
 
 
-db = TinyDB('./MusicBotDB.json')
+db = TinyDB('./MusicBotDB_dev.json')
 
 def message_id_exists(uid):
 	exists = db.search(where('uid') == uid)
 	return len(exists) > 0
 
 
-action_queue = asyncio.JoinableQueue()
 message_queue = asyncio.JoinableQueue()
 command_task_queue = asyncio.JoinableQueue()
-command_action_queue = asyncio.JoinableQueue()
-database_queue = asyncio.JoinableQueue()
 task_queue = asyncio.JoinableQueue()
 
-websocket_queue = asyncio.JoinableQueue()
 
 state = {
 	'db': db
 }
 
-@asyncio.coroutine
-def database_task():
-	global state
-	while True:
-		db_item = yield from database_queue.get()
-		if not message_id_exists(db_item['uid']):
-				state['db'].insert(db_item)
+class PlayQueuedSongsTask(object):
 
-		database_queue.task_done()
+	def __init__(self):
+		self.message_queue = asyncio.JoinableQueue()
+		self.song_queue = []
+		self.play_callback = None
+
+	@asyncio.coroutine
+	def play_later(self, delay, song_one, song_two):
+		yield from asyncio.sleep(delay)
+		yield from self.action_queue.put(PlayOneSongAction(song_one, song_two))
+
+	def play_song(self, delay):
+			(one, two) = self.get_next_songs()
+			if self.play_callback:
+				self.play_callback.cancel()
+			print('\tplaying: ', one, two, ' in {} seconds'.format(delay))
+			self.play_callback = asyncio.get_event_loop().create_task(
+				self.play_later(delay, one, two)
+				)
+
+	def handle_queue_command(self, command):
+		print('handle_queue_command: ', command)
+		print('\tqueue:', self.song_queue)
+		self.song_queue.append(command.youtube_info)
+		if self.play_callback and self.play_callback.done():
+			self.play_song(0)
+		print('\tqueue:', self.song_queue)
+
+	def get_next_songs(self):
+		first = None
+		next = None
+		if len(self.song_queue) > 0:
+			first = self.song_queue[0]
+		if len(self.song_queue) > 1:
+			first = self.song_queue[1]
+
+		return first, next
+
+	def handle_play_event(self, play):
+		print('handle_play_event: ', play)
+		print('\tqueue:', self.song_queue)
+		print('\t{} == {} -> {}'.format(self.song_queue[0], play.youtube_info, self.song_queue[0] == play.youtube_info))
+		if self.song_queue and self.song_queue[0] == play.youtube_info:
+			print('\tremoving: ', play.youtube_info)
+			self.song_queue.remove(play.youtube_info)
+			print('\tqueue:', self.song_queue)
+		if self.song_queue:
+			self.play_song(play.get_duration_int())
 
 
-@asyncio.coroutine
-def cull_tasks_and_add_to_db():
-	global state
-	while True:
-		task = yield from task_queue.get()
-		#yield from message_queue.join() # process all messages
-		yield from database_queue.join() # process all db inserts
-		events = state['db'].search( where('type').contains(Event.DB_TAG) & (where('timestamp') > task.timestamp)) 
-		events = [DBItem.create_object_from_db_entry(event) for event in events]
-		#print('Checking Task: {}'.format(task))
-		satisfied = False
-		for event in events:
-			if task.satisfied_by_event(state, event):
-				#print('{} satisfied by {}'.format(task, event))
-				for action in task.get_actions():
-					yield from action_queue.put(action)
-
-				satisfied = True
-				break
-		if not satisfied:
-			yield from database_queue.put(task.to_db_dict())
-
-		task_queue.task_done()
-
-@asyncio.coroutine
-def execute_actions_task():
-	global state
-	def mid():
-		i = 0
+	@asyncio.coroutine
+	def coroutine(self, action_queue, db):
+		self.action_queue = action_queue
 		while True:
-			yield i
-			i +=1
-	id_gen = mid()
-	while True:
-		action = yield from action_queue.get()
-
-		# set websocket
-		current_ws = yield from websocket_queue.get()
-		if not websocket_queue.empty():
-			print('got websocket, but queue is not empty!')
-		action.ws = current_ws
-		yield from websocket_queue.put(current_ws)
-		websocket_queue.task_done()
-
-		#print('processing action: {}'.format(action))
-		task = action.get_coroutine(state,  id_gen, action_queue)
-		asyncio.Task(task())
-
-		action_queue.task_done()
+			message = yield from self.message_queue.get()
+			if QueueCommand.DB_TAG in message.DB_TAG:
+				self.handle_queue_command(message)
+			elif PlayEvent.DB_TAG in message.DB_TAG:
+				self.handle_play_event(message)
 
 
-@asyncio.coroutine
-def queue_command_tasks():
-	while True:
-		command = yield from command_task_queue.get()
+class DebugQueueTask(object):
+
+	def __init__(self):
+		self.message_queue = asyncio.JoinableQueue()
+		self.song_queue = []
+
+	def handle_queue_command(self, command):
+		self.song_queue.append(command.youtube_info)
+		print(self.song_queue)
+
+	def handle_play_event(self, play):	
+		if self.song_queue and self.song_queue[0] == play.youtube_info:
+			self.song_queue.remove(play.youtube_info)
+			print(self.song_queue)
+
+	@asyncio.coroutine
+	def coroutine(self, action_queue, db):
+		self.action_queue = action_queue
+		while True:
+			message = yield from self.message_queue.get()
+			if QueueCommand.DB_TAG in message.DB_TAG:
+				self.handle_queue_command(message)
+			elif PlayEvent.DB_TAG in message.DB_TAG:
+				self.handle_play_event(message)
+
+
+class NeonDJBot(object):
+	def __init__(self, db, room_address, packet_queue):
+		self.loop = asyncio.get_event_loop()
+		self.message_queue = asyncio.JoinableQueue()
+		self.database_queue = asyncio.JoinableQueue()
+		self.action_queue = asyncio.JoinableQueue()
+		self.packet_queue = packet_queue
+
+		self.room_address = room_address
+		self.ws_lock = asyncio.Lock()
+		self.ws = None
+		self.db = db
+		self.internal_coroutines = []
+		self.task_queues = []
+		self.tasks = []
+		self.mid = 0
+
+	def reset_mid(self):
+		def mid_itr():
+			i = 0
+			while True:
+				yield i
+				i += 1
+		self.mid = mid_itr()
+
+	def add_task(self, task):
+		t = self.loop.create_task(task.coroutine(self.action_queue, self.db))
+		self.tasks.append(t)
+		self.task_queues.append(task.message_queue)
+
+	@asyncio.coroutine
+	def setup(self):
+		#yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
+		yield from self.action_queue.put(DebugListCurrentSong())
+		yield from self.action_queue.put(DebugListQueue())
+		#yield from self.action_queue.put(PlayNextQueuedSongAction())
+
+	@asyncio.coroutine
+	def recv_loop(self):
+		yield from self.setup()
+		while True:
+			if not self.ws or not packet: #server d/c or connect
+				yield from self.ws_lock
+				try:
+					self.ws = yield from websockets.connect(self.room_address)
+				except:
+					print('connection failed')
+					yield from asyncio.sleep(1)
+					continue
+
+				print('connection succeeded')
+				self.ws_lock.release()
+				#yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
+
+			packet = yield from self.ws.recv()
+			if packet:
+				packet = Packet(packet)
+
+				if packet.type == 'ping-event':
+					yield from self.action_queue.put(PingAction())
+				else:
+					for message in packet.messages():
+						yield from self.packet_queue.put(message)
+
+	@asyncio.coroutine
+	def execute_actions_task(self):
+		while True:
+			if self.ws:
+				action = yield from self.action_queue.get()
+
+				# set websocket
+				yield from self.ws_lock
+				action.ws = self.ws
+				self.ws_lock.release()
+
+				print('processing action: {}'.format(action))
+				task = action.get_coroutine(state, self.mid, self.action_queue)
+				asyncio.async(task())
+
+				self.action_queue.task_done()
+			else:
+				yield from asyncio.sleep(1)
+
+	def message_in_db(self, message):
+		return self.db.count(where('uid') == message['uid']) > 0
+
+	@asyncio.coroutine
+	def distribute_messages(self):
+		while True:
+			new_message = yield from self.message_queue.get()
+			#print('sending {} to tasks.'.format(new_message))
+
+			yield from self.database_queue.put(new_message)
+
+			for queue in self.task_queues:
+				# todo: make this a non-blocking call
+				yield from queue.put(new_message)
+
+			self.message_queue.task_done()
+
+	@asyncio.coroutine
+	def add_to_db(self):
+		while True:
+			db_item = yield from self.database_queue.get()
+			#print('adding {} to DB'.format(db_item))
+			if hasattr(db_item, 'to_db_dict'):
+				db_dict = db_item.to_db_dict()
+				#if not message_id_exists(db_item['uid']):
+				if not self.message_in_db(db_dict):
+						self.db.insert(db_dict)
+
+			self.database_queue.task_done()	
+
+	def connect(self):
+		message_task = self.loop.create_task(self.distribute_messages())
+		db_task = self.loop.create_task(self.add_to_db())
+
+		self.internal_coroutines = [message_task, db_task]
+		self.loop.run_until_complete(self.recv_loop())
+
+#bot = NeonDJBot(db, 'ws://localhost:8765/', message_queue)
+bot = NeonDJBot(db, 'wss://euphoria.io/room/music/ws', message_queue)
+bot.add_task(CommandActionTask())
+bot.add_task(PlayQueuedSongsTask())
+#bot.add_task(DebugQueueTask())
+
+#@asyncio.coroutine
+#def cull_tasks_and_add_to_db():
+	#global state
+	#global bot
+	#while True:
+		#task = yield from task_queue.get()
+		#yield from message_queue.join() # process all messages
+		#yield from bot.database_queue.join() # process all db inserts
+		#events = state['db'].search( where('type').contains(Event.DB_TAG) & (where('timestamp') > task.timestamp)) 
+		#events = [DBItem.create_object_from_db_entry(event) for event in events]
+		#print('Checking Task: {}'.format(task))
+		#satisfied = False
+		#for event in events:
+		#	if task.satisfied_by_event(state, event):
+		#		#print('{} satisfied by {}'.format(task, event))
+		#		for action in task.get_actions():
+		#			yield from bot.action_queue.put(action)
+
+		#		satisfied = True
+		#		break
+		#if not satisfied:
+			#yield from database_queue.put(task.to_db_dict())
+		#	yield from bot.database_queue.put(task)
+
+
+		#task_queue.task_done()
+
+
+#@asyncio.coroutine
+#def queue_command_tasks():
+	#while True:
+		#command = yield from command_task_queue.get()
 		#print('Adding tasks from command: {}'.format(command))
-		for task in command.get_tasks():
-			if not task.is_prepared():
-				print('Wont queue un-prepared task: {}'.format(task))
-				continue
-			
-			yield from task_queue.put(task)
-		command_task_queue.task_done()
+		#for task in command.get_tasks():
+		#	if not task.is_prepared():
+		#		print('Wont queue un-prepared task: {}'.format(task))
+		#		continue
+		#	
+		#	yield from task_queue.put(task)
+		#command_task_queue.task_done()
 		
 
 @asyncio.coroutine
 def parse_messages():
 	global state
+	global bot
 	while True:
 		message = yield from message_queue.get()
-		#print('message: {}'.format(message.data['content']))
+		print('message: {}'.format(message.data['content']))
 		if message_id_exists(message.uid):
 			if not message.past:
 				print('ignoring {}'.format(message.data['content']))
@@ -1049,7 +1260,7 @@ def parse_messages():
 			continue
 		db_object = create_db_object(message)
 		if db_object:
-			#print('DB Object: {}'.format(db_object))
+			print('DB Object: {}'.format(db_object))
 			if not db_object.is_prepared():
 				try:
 					db_object.prepare()
@@ -1059,89 +1270,38 @@ def parse_messages():
 					continue
 
 			#print('Adding to DB: {}'.format(db_object))
-			if Event.DB_TAG in db_object.DB_TAG:
-				tasks = db.search(where('type').contains(Task.DB_TAG))
-				tasks = [DBItem.create_object_from_db_entry(task) for task in tasks]
+			#if Event.DB_TAG in db_object.DB_TAG:
+			#	tasks = db.search(where('type').contains(Task.DB_TAG))
+			#	tasks = [DBItem.create_object_from_db_entry(task) for task in tasks]
 				#print('Checking Event: {}'.format(db_object))
 				#print('Current Tasks: {}'.format(tasks))
-				for task in tasks:
-					if task.satisfied_by_event(state, db_object):
+			#	for task in tasks:
+			#		if task.satisfied_by_event(state, db_object):
 						#print('{} satisfied by {}'.format(task, db_object))
-						for action in task.get_actions():
-							yield from action_queue.put(action)
-						break
+			#			for action in task.get_actions():
+			#				yield from bot.action_queue.put(action)
+			#			break
 
-			yield from database_queue.put(db_object.to_db_dict())
+			#yield from database_queue.put(db_object.to_db_dict())
+			yield from bot.database_queue.put(db_object)
+			#print('database queue size: {}'.format(bot.database_queue.qsize()))
+			yield from bot.database_queue.join()
 
-			if Command.DB_TAG in db_object.DB_TAG:
+			#if Command.DB_TAG in db_object.DB_TAG:
 
 				#print('Adding to task queue: {}'.format(db_object))
-				yield from command_task_queue.put(db_object)
+			#	yield from command_task_queue.put(db_object)
 
-				if not message.past:
+				#if not message.past:
 					#print('Adding to action queue: {}'.format(db_object))
-					yield from command_action_queue.put(db_object)
+					#yield from command_action_queue.put(db_object)
+			yield from bot.message_queue.put(db_object)
 					
 		message_queue.task_done()
 
-@asyncio.coroutine
-def queue_command_actions():
-	while True:
-		command = yield from command_action_queue.get()	
-		for action in command.get_actions():
-			#print('{} -> {}'.format(command, action))
-			yield from action_queue.put(action)
 
-		command_action_queue.task_done()
-
-
-
-@asyncio.coroutine
-def loop():
-	ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
-	#ws = yield from websockets.connect('ws://localhost:8765/')
-
-	yield from websocket_queue.put(ws)
-
-	yield from action_queue.put(SetNickAction("♬|NeonDJBot"))
-	yield from action_queue.put(DebugListCurrentSong())
-	yield from action_queue.put(DebugListQueue())
-	yield from action_queue.put(PlayNextQueuedSongAction())
-
-	while True:
-		packet = yield from ws.recv()
-		if not packet: #server d/c
-			outdated_ws = yield from websocket_queue.get()
-			if not websocket_queue.empty():
-				print('got websocket, but queue is not empty!')
-			while True:
-				print('reconnect loop')
-				yield from asyncio.sleep(1)
-				try:
-					ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
-					#ws = yield from websockets.connect('ws://localhost:8765/')
-				except:
-					continue
-
-				print('reconnect succeeded')
-				yield from websocket_queue.put(ws)
-				packet = yield from ws.recv()
-				yield from action_queue.put(SetNickAction("♬|NeonDJBot"))
-				break
-			websocket_queue.task_done()
-		packet = Packet(packet)
-
-		if packet.type == 'ping-event':
-			yield from action_queue.put(PingAction())
-		else:
-			for message in packet.messages():
-				yield from message_queue.put(message)
-
-asyncio.Task(database_task())
-asyncio.Task(execute_actions_task())
 asyncio.Task(parse_messages())
-asyncio.Task(queue_command_actions())
-asyncio.Task(queue_command_tasks())
-asyncio.Task(cull_tasks_and_add_to_db())
+#asyncio.Task(queue_command_tasks())
+#asyncio.Task(cull_tasks_and_add_to_db())
 
-asyncio.get_event_loop().run_until_complete(loop())
+bot.connect()

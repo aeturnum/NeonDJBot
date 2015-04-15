@@ -3,7 +3,7 @@ import websockets
 
 @asyncio.coroutine
 def loop(websocket, path):
-	f = open('room_log.log' , 'r')
+	f = open('music_room.log' , 'r')
 	line = f.readline()
 	while line != '':
 		yield from websocket.send(line.strip())
