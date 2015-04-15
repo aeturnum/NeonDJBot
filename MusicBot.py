@@ -410,7 +410,7 @@ class PlayEvent(Event):
 		super(PlayEvent, self).__init__(message_or_db)
 
 	def get_duration(self):
-		return timedelta(seconds=(self.youtube_info.time_seconds()) + 6)
+		return timedelta(seconds=(self.youtube_info.time_seconds()) + 3)
 
 	def __repr__(self):
 		return str(self)
@@ -449,8 +449,9 @@ class Action(object):
 					message['id'] = str(next(id_generator))
 					try:
 						yield from self.ws.send(json.dumps(message))
-					except InvalidState:
+					except websockets.exceptions.InvalidState:
 						# websocket closed
+						print('websocket disconnected, getting new websocket')
 						yield from action_queue.put(self)
 						break
 					except TypeError:
@@ -646,7 +647,7 @@ class VoteSkipAction(SongAction):
 
 
 class DebugListCurrentSong(SongAction):
-	LOOP_DELAY = 5
+	LOOP_DELAY = 1
 
 	def __init__(self):
 		super(DebugListCurrentSong, self).__init__()
@@ -655,7 +656,7 @@ class DebugListCurrentSong(SongAction):
 	def should_repeat(self, state):
 		current_song = self.currently_playing(state['db'])
 		if current_song:
-			if current_song.remaining_duration() < 20:
+			if current_song.remaining_duration() < 10:
 				print("Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
 			elif current_song.remaining_duration() % 20 == 0:
 				print("Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
@@ -1114,14 +1115,18 @@ def loop():
 			if not websocket_queue.empty():
 				print('got websocket, but queue is not empty!')
 			while True:
+				print('reconnect loop')
 				yield from asyncio.sleep(1)
 				try:
 					ws = yield from websockets.connect('wss://euphoria.io/room/music/ws')
+					#ws = yield from websockets.connect('ws://localhost:8765/')
 				except:
 					continue
 
+				print('reconnect succeeded')
 				yield from websocket_queue.put(ws)
 				packet = yield from ws.recv()
+				yield from action_queue.put(SetNickAction("♬|NeonDJBot"))
 				break
 			websocket_queue.task_done()
 		packet = Packet(packet)
