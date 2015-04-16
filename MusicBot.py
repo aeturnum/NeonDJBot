@@ -1032,7 +1032,6 @@ class PlayQueuedSongsTask(object):
 	def handle_play_event(self, play):
 		print('handle_play_event: ', play)
 		print('\tqueue:', self.song_queue)
-		print('\t{} == {} -> {}'.format(self.song_queue[0], play.youtube_info, self.song_queue[0] == play.youtube_info))
 		if self.song_queue and self.song_queue[0] == play.youtube_info:
 			print('\tremoving: ', play.youtube_info)
 			self.song_queue.remove(play.youtube_info)
@@ -1078,13 +1077,116 @@ class DebugQueueTask(object):
 				self.handle_play_event(message)
 
 
+class BotMiddleware(object):
+	TAG_CONSUMES = ''
+	TAG_PRODUCES = []
+	MIDDLEWARE_REQUIRED = []
+
+	def __init__(self):
+		self.input = asyncio.JoinableQueue()
+		self.output = {}
+		self.task = None
+
+	def register_queues(self, host):
+		if self.TAG_CONSUMES != '':
+			host.recieve_messages_for_tag(self.TAG_CONSUMES, self.input)
+		for tag in self.TAG_PRODUCES:
+			self.output[tag] = host.get_input_queue(tag)
+
+	def create_task(self, loop, db):
+		self.task = loop.create_task(self.run(db))
+
+	def cancel(self):
+		if self.task and not self.task.done():
+			self.task.cancel()
+
+	@asyncio.coroutine
+	def run(self, db):
+		return
+
+	def __eq__(self, other):
+		return type(self) == type(other)
+
+	def __hash__(self):
+		return hash(str(type(self)))
+
+
+class PacketMiddleware(BotMiddleware):
+	TAG_DB_OBJECT = 'tag_db_object'
+	TAG_BOT_MESSAGE = 'tag_bot_message'
+
+	TAG_CONSUMES = 'tag_raw'
+	TAG_PRODUCES = [TAG_DB_OBJECT, TAG_BOT_MESSAGE]
+
+	ENABLED_MESSAGES = [
+		QueueCommand,
+		SkipCommand,
+		ClearQueueCommand,
+		ListQueueCommand,
+		TestSkipCommand,
+		NeonLightShowCommand,
+		HelpCommand,
+		DumpQueueCommand,
+		PlayEvent
+	]
+
+	def message_id_exists(self, db, uid):
+		exists = db.search(where('uid') == uid)
+		return len(exists) > 0
+
+	def create_db_object(self, packet):
+		content = packet.data['content']
+		for event_class in self.ENABLED_MESSAGES:
+			if event_class.is_this(content):
+				try:
+					return event_class(packet)
+				except:
+					print('failed to create: {}'.format(packet.data))
+		return None
+
+	@asyncio.coroutine
+	def run(self, db):
+		print('middleware loop running')
+		db_queue = self.output[self.TAG_DB_OBJECT]
+		message_queue = self.output[self.TAG_BOT_MESSAGE]
+		while True:
+			message = yield from self.input.get()
+			print('message: {}'.format(message.data['content']))
+			if message_id_exists(message.uid):
+				if not message.past:
+					print('ignoring {}'.format(message.data['content']))
+				self.input.task_done()
+				continue
+			db_object = self.create_db_object(message)
+			if db_object:
+				print('DB Object: {}'.format(db_object))
+				if not db_object.is_prepared():
+					try:
+						db_object.prepare()
+					except:
+						print('Failed to process: {}'.format(db_object))
+						message_queue.task_done()
+						continue
+
+				print('putting in db queue')
+				yield from db_queue.put(db_object)
+				print('joining on db queue')
+				yield from db_queue.join()
+
+				yield from message_queue.put(db_object)
+
+			self.input.task_done()
+
+
 class NeonDJBot(object):
+	TAG_RAW = 'tag_raw'
+
 	def __init__(self, db, room_address, packet_queue):
 		self.loop = asyncio.get_event_loop()
 		self.message_queue = asyncio.JoinableQueue()
 		self.database_queue = asyncio.JoinableQueue()
 		self.action_queue = asyncio.JoinableQueue()
-		self.packet_queue = packet_queue
+		#self.packet_queue = packet_queue
 
 		self.room_address = room_address
 		self.ws_lock = asyncio.Lock()
@@ -1094,6 +1196,55 @@ class NeonDJBot(object):
 		self.task_queues = []
 		self.tasks = []
 		self.mid = 0
+
+		### middleware
+
+		self.middleware = set()
+		self.queues = {}
+		self.packet_queue = self._get_create_queue(self.TAG_RAW)['producer']
+		self.recieve_messages_for_tag(PacketMiddleware.TAG_BOT_MESSAGE, self.message_queue)
+		self.recieve_messages_for_tag(PacketMiddleware.TAG_DB_OBJECT, self.database_queue)
+
+	def add_middleware(self, middleware):
+		if not middleware in self.middleware:
+			print('adding middleware: ', middleware)
+			middleware.register_queues(self)
+			middleware.create_task(self.loop, self.db)
+
+			self.middleware.add(middleware)
+
+
+	def _get_create_queue(self, tag):
+		if tag not in self.queues:
+			self.queues[tag] = {
+				'producer': asyncio.JoinableQueue(),
+				'consumers': [],
+				'message_exchange': None,
+			}
+			self.queues[tag]['message_exchange'] = self.loop.create_task(self.exchange_messages(self.queues[tag]))
+		
+		return self.queues[tag]
+
+	def recieve_messages_for_tag(self, tag, queue):
+		print('recieve_messages_for_tag({}, {})'.format(tag, queue))
+		tagged_queue = self._get_create_queue(tag)
+		tagged_queue['consumers'].append(queue)
+
+	def get_input_queue(self, tag):
+		tagged_queue = self._get_create_queue(tag)
+		print('get_input_queue({}) ->'.format(tag, tagged_queue['producer']))
+		return tagged_queue['producer']
+
+	@asyncio.coroutine
+	def exchange_messages(self, tag_data):
+		while True:
+			message = yield from tag_data['producer'].get()
+
+			for q in tag_data['consumers']:
+				yield from q.put(message)
+
+			tag_data['producer'].task_done()
+
 
 	def reset_mid(self):
 		def mid_itr():
@@ -1182,7 +1333,7 @@ class NeonDJBot(object):
 	def add_to_db(self):
 		while True:
 			db_item = yield from self.database_queue.get()
-			#print('adding {} to DB'.format(db_item))
+			print('adding {} to DB'.format(db_item))
 			if hasattr(db_item, 'to_db_dict'):
 				db_dict = db_item.to_db_dict()
 				#if not message_id_exists(db_item['uid']):
@@ -1200,6 +1351,7 @@ class NeonDJBot(object):
 
 #bot = NeonDJBot(db, 'ws://localhost:8765/', message_queue)
 bot = NeonDJBot(db, 'wss://euphoria.io/room/music/ws', message_queue)
+bot.add_middleware(PacketMiddleware())
 bot.add_task(CommandActionTask())
 bot.add_task(PlayQueuedSongsTask())
 #bot.add_task(DebugQueueTask())
