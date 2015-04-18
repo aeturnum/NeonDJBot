@@ -307,91 +307,6 @@ class DBItem(object):
 		if db_dict['type'] in DBItem.SUBCLASSES:
 			return DBItem.SUBCLASSES[db_dict['type']](db_dict)
 
-
-class Task(DBItem):
-	DB_TAG = 'database_task'
-
-	@classmethod
-	def new_task(cls, user, uid, timestamp, fields=[]):
-		fake_db_dict = { 'user':user.to_db_dict(), 'uid':uid, 'timestamp':timestamp }
-		# avoid re-processing if we can
-		for field in fields:
-			fake_db_dict[field.FIELD_NAME] = field.to_db_dict()
-		return cls(fake_db_dict)
-
-	def __init__(self, message_or_db):
-		super(Task, self).__init__(message_or_db)
-		self.message_queue = asyncio.JoinableQueue()
-
-	@asyncio.coroutine
-	def coroutine(self, action_queue):
-		return
-
-	def satisfied_by_event(self, state, event):
-		db = state['db']
-		if self.process_event(state, event):
-			db.remove((where('type') == self.DB_TAG) & (where('uid') == self.uid))
-			return True
-		return False
-
-	def check_expired(self, state):
-		if self.expired():
-			db.remove((where('type') == self.DB_TAG) & (where('uid') == self.uid))
-			return True
-		return False
-
-	def process_event(self, state, event):
-		return True
-
-	def expired(self):
-		return False
-
-	def get_actions(self):
-		return []
-
-	def __repr__(self):
-		return str(self)
-
-	def __str__(self):
-		return '{}:{}'.format(self.DB_TAG, self.satisfied)
-
-class CommandActionTask(object):
-
-	def __init__(self):
-		self.message_queue = asyncio.JoinableQueue()
-
-	@asyncio.coroutine
-	def coroutine(self, action_queue, db):
-		while True:
-			message = yield from self.message_queue.get()
-			print('handling {} actions from'.format(message))
-			if hasattr(message, 'get_actions'):
-				for action in message.get_actions():
-					yield from action_queue.put(action)
-
-			self.message_queue.task_done()
-
-
-class PlaySongTask(Task):
-	DB_TAG = 'database_task_playsong'
-
-	CLASS_FIELDS = [YoutubeInfo]
-
-	def __init__(self, message_or_db):
-		self.add_fields(self, PlaySongTask.CLASS_FIELDS)
-		super(PlaySongTask, self).__init__(message_or_db)
-
-	def process_event(self, state, event):
-		if event.DB_TAG == PlayEvent.DB_TAG:
-			if event.youtube_info == self.youtube_info:
-				return True
-
-	def __repr__(self):
-		return str(self)
-
-	def __str__(self):
-		return '[PlayTask] {}'.format(self.youtube_info)
-
 class Event(DBItem):
 	DB_TAG = 'database_event'
 	EVENT_TEXT = ''
@@ -506,7 +421,7 @@ class PacketAction(Action):
 	@classmethod
 	def send_packet(cls, text, parent_message):
 		print("Send Packet: {}".format(text))
-		#return cls._wrap('send', {"content":text,"parent":parent_message})
+		return cls._wrap('send', {"content":text,"parent":parent_message})
 
 	@classmethod
 	def nick_packet(cls, nick):
@@ -596,6 +511,39 @@ class QueuedNotificationAction(SongAction):
 
 		return self.send_packet(text, self.reply_to)
 
+class QueuedNotificationAction2(SongAction):
+	def __init__(self, queue, currently_playing, song_info, reply_to = ''):
+		super(QueuedNotificationAction2, self).__init__()
+		self.song_info = song_info
+		self.reply_to = reply_to
+		self.queue = queue
+		self.current_song = currently_playing
+
+	def packet_to_send(self, state):
+		queue = self.queue
+		current_song = self.current_song
+
+		wait = timedelta(seconds=0)
+		song_string = '{} queued'.format(self.song_info.display())
+		wait_str = 'now.'
+		if current_song:
+			wait = timedelta(seconds=current_song.remaining_duration())
+			wait_str = 'in {}'.format(str(wait))
+		text = '{} first and will be played {}'.format(song_string, wait_str)
+		if queue:
+			position = 1
+			for task in queue:
+				if self.reply_to in task.uid:
+					break
+				wait = wait + timedelta(seconds=task.youtube_info.time_seconds())
+				position += 1
+
+			if position > 1:
+				text = '{} at position [{}] and will be played in {}'.format(song_string, position, str(wait))
+
+
+		return self.send_packet(text, self.reply_to)
+
 class ClearQueueAction(SongAction):
 	def should_repeat(self, state):
 		self.clear_queue(state['db'])
@@ -630,7 +578,9 @@ class PlayQueuedSongAction(SongAction):
 		return None, None
 
 	def packet_to_send(self, state):
+		print("PlayQueuedSongAction::packet_to_send")
 		(song_to_play, next_song) = self.get_song_to_play(state)
+		print("songs:", song_to_play, next_song)
 		if song_to_play:
 			return self.send_packet(
 				self.play_message(song_to_play, next_song),
@@ -662,7 +612,8 @@ class SkipCurrentSongAction(PlayQueuedSongAction):
 		return None, None
 
 class PlayOneSongAction(PlayQueuedSongAction):
-	def __init__(self, reply_to='', song_one=None, song_two=None):
+	def __init__(self, song_one=None, song_two=None, reply_to=''):
+		print("playOneSong: {}, {}".format(song_one, song_two))
 		super(PlayOneSongAction, self).__init__(reply_to)
 		self.song_one = song_one
 		self.song_two = song_two
@@ -727,6 +678,45 @@ class ListQueue(SongAction):
 	def packet_to_send(self, state):
 		song_queue = self.queued_songs(state['db'])
 		current_song = self.currently_playing(state['db'])
+		message = 'Nothing Queued'
+		if song_queue:
+			place = 1
+			total_duration = timedelta(seconds=current_song.remaining_duration())
+			max_duration_width = max(len(str(total_duration)),len('wait time'))
+			max_position_width = 1
+			max_song_title_width = len('song title')
+			for song in song_queue:
+				max_position_width = max(len(str(place)), max_position_width)
+				place += 1
+
+			place = 1
+			time_and_pos_formatting_string = '[{{:^{}}}][{{:^{}}}]'
+			time_format = time_and_pos_formatting_string.format(
+					max_position_width, max_duration_width,
+				)
+			strings = [time_format.format('#', 'wait time')]
+			for song in song_queue:
+				song_string = time_format.format(place, str(total_duration))
+				song_string += ' {} added by [{}]'.format(song.youtube_info.display(), song.user.name)
+				strings.append(song_string)
+
+				place += 1
+				total_duration = total_duration + timedelta(seconds=song.youtube_info.time_seconds())
+
+			return self.send_packet('\n'.join(strings), self.reply_to)
+
+		return self.send_packet(message, self.reply_to)
+
+class ListQueueAction(SongAction):
+	def __init__(self, queue, current_song, reply_to):
+		super(ListQueueAction, self).__init__()
+		self.reply_to = reply_to
+		self.queue = queue
+		self.current_song = current_song
+
+	def packet_to_send(self, state):
+		song_queue = self.queue
+		current_song = self.current_song
 		message = 'Nothing Queued'
 		if song_queue:
 			place = 1
@@ -826,8 +816,10 @@ class QueueCommand(Command):
 		return 'Added to queue: {}'.format(self.youtube_info.display())
 
 	def get_actions(self):
+		return []
 		#return [ReplyAction(self._generate_confirmation_text(), str(self.parent_id))]
-		return [QueuedNotificationAction(self.youtube_info, str(self.parent_id))]
+		#return [QueuedNotificationAction(self.youtube_info, str(self.parent_id))]
+
 
 	def get_tasks(self):
 		return [PlaySongTask.new_task(self.user, self.uid+'_1', self.timestamp, fields=[self.youtube_info])]
@@ -853,7 +845,8 @@ class ListQueueCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [ListQueue(str(self.parent_id))]
+		#return [ListQueue(str(self.parent_id))]
+		return []
 
 	@classmethod
 	def help_string(cls):
@@ -865,7 +858,8 @@ class DumpQueueCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [DumpQueue(str(self.parent_id))]
+		#return [DumpQueue(str(self.parent_id))]
+		return []
 
 	@classmethod
 	def help_string(cls):
@@ -877,7 +871,8 @@ class SkipCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [SkipCurrentSongAction()]
+		#return [SkipCurrentSongAction()]
+		return []
 
 	@classmethod
 	def help_string(cls):
@@ -889,7 +884,8 @@ class TestSkipCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		return [VoteSkipAction()]
+		#return [VoteSkipAction()]
+		return []
 
 class NeonLightShowCommand(Command):
 	DB_TAG = 'database_command_neonlightshow'
@@ -906,12 +902,12 @@ class HelpCommand(Command):
 	COMMAND = '!help'
 	COMMAND_LOCATION = 'start'
 
-	def get_help_lines(self):
-		global enabled_commands
+	def set_commands(self, commands):
+		self.commands = commands
 
+	def get_help_lines(self):
 		lines = []
-		for command in enabled_commands:
-			print('help string: {}'.format(command))
+		for command in self.commands:
 			if command.help_string():
 				lines.append(command.help_string())
 		if len(lines):
@@ -941,38 +937,6 @@ DBItem.SUBCLASSES.update(
 	{PlayEvent.DB_TAG: PlayEvent}
 	)
 
-enabled_commands = [
-		QueueCommand,
-		SkipCommand,
-		ClearQueueCommand,
-		ListQueueCommand,
-		TestSkipCommand,
-		NeonLightShowCommand,
-		HelpCommand,
-		DumpQueueCommand
-	]
-
-enabled_events = [
-		PlayEvent,
-	]
-
-
-
-def create_db_object(packet):
-	global enabled_events
-	global enabled_commands
-	db_objects = []
-	db_objects.extend(enabled_events)
-	db_objects.extend(enabled_commands)
-	content = packet.data['content']
-	for event_class in db_objects:
-		if event_class.is_this(content):
-			try:
-				return event_class(packet)
-			except:
-				print('failed to create: {}'.format(packet.data))
-	return None
-
 
 db = TinyDB('./MusicBotDB_dev.json')
 
@@ -990,97 +954,13 @@ state = {
 	'db': db
 }
 
-class PlayQueuedSongsTask(object):
-
-	def __init__(self):
-		self.message_queue = asyncio.JoinableQueue()
-		self.song_queue = []
-		self.play_callback = None
-
-	@asyncio.coroutine
-	def play_later(self, delay, song_one, song_two):
-		yield from asyncio.sleep(delay)
-		yield from self.action_queue.put(PlayOneSongAction(song_one, song_two))
-
-	def play_song(self, delay):
-			(one, two) = self.get_next_songs()
-			if self.play_callback:
-				self.play_callback.cancel()
-			print('\tplaying: ', one, two, ' in {} seconds'.format(delay))
-			self.play_callback = asyncio.get_event_loop().create_task(
-				self.play_later(delay, one, two)
-				)
-
-	def handle_queue_command(self, command):
-		print('handle_queue_command: ', command)
-		print('\tqueue:', self.song_queue)
-		self.song_queue.append(command.youtube_info)
-		if self.play_callback and self.play_callback.done():
-			self.play_song(0)
-		print('\tqueue:', self.song_queue)
-
-	def get_next_songs(self):
-		first = None
-		next = None
-		if len(self.song_queue) > 0:
-			first = self.song_queue[0]
-		if len(self.song_queue) > 1:
-			first = self.song_queue[1]
-
-		return first, next
-
-	def handle_play_event(self, play):
-		print('handle_play_event: ', play)
-		print('\tqueue:', self.song_queue)
-		if self.song_queue and self.song_queue[0] == play.youtube_info:
-			print('\tremoving: ', play.youtube_info)
-			self.song_queue.remove(play.youtube_info)
-			print('\tqueue:', self.song_queue)
-		if self.song_queue:
-			self.play_song(play.get_duration_int())
-
-
-	@asyncio.coroutine
-	def coroutine(self, action_queue, db):
-		self.action_queue = action_queue
-		while True:
-			message = yield from self.message_queue.get()
-			if QueueCommand.DB_TAG in message.DB_TAG:
-				self.handle_queue_command(message)
-			elif PlayEvent.DB_TAG in message.DB_TAG:
-				self.handle_play_event(message)
-
-
-class DebugQueueTask(object):
-
-	def __init__(self):
-		self.message_queue = asyncio.JoinableQueue()
-		self.song_queue = []
-
-	def handle_queue_command(self, command):
-		self.song_queue.append(command.youtube_info)
-		print(self.song_queue)
-
-	def handle_play_event(self, play):	
-		if self.song_queue and self.song_queue[0] == play.youtube_info:
-			self.song_queue.remove(play.youtube_info)
-			print(self.song_queue)
-
-	@asyncio.coroutine
-	def coroutine(self, action_queue, db):
-		self.action_queue = action_queue
-		while True:
-			message = yield from self.message_queue.get()
-			if QueueCommand.DB_TAG in message.DB_TAG:
-				self.handle_queue_command(message)
-			elif PlayEvent.DB_TAG in message.DB_TAG:
-				self.handle_play_event(message)
-
 
 class BotMiddleware(object):
-	TAG_CONSUMES = ''
+	TAG = ''
+	TAG_CONSUMES = []
 	TAG_PRODUCES = []
 	MIDDLEWARE_REQUIRED = []
+	MIDDLEWARE_SUPPORT_REQUESTS = {}
 
 	def __init__(self):
 		self.input = asyncio.JoinableQueue()
@@ -1088,13 +968,21 @@ class BotMiddleware(object):
 		self.task = None
 
 	def register_queues(self, host):
-		if self.TAG_CONSUMES != '':
-			host.recieve_messages_for_tag(self.TAG_CONSUMES, self.input)
+		for tag in self.TAG_CONSUMES:
+			host.recieve_messages_for_tag(tag, self.input)
 		for tag in self.TAG_PRODUCES:
 			self.output[tag] = host.get_input_queue(tag)
+		if self.TAG:
+			self.output[self.TAG] = host.get_input_queue(self.TAG)
 
 	def create_task(self, loop, db):
 		self.task = loop.create_task(self.run(db))
+
+	def request_support(self, request):
+		return False
+
+	def support_request_failed(self, middleware_tag, middleware_response):
+		raise ValueError('Middleware {} returned an errror: {}'.format(middleware_tag, middleware_response))
 
 	def cancel(self):
 		if self.task and not self.task.done():
@@ -1105,30 +993,42 @@ class BotMiddleware(object):
 		return
 
 	def __eq__(self, other):
-		return type(self) == type(other)
+		if hasattr(other, 'TAG'):
+			return type(self.TAG) == type(other.TAG)
+		return False
 
 	def __hash__(self):
-		return hash(str(type(self)))
+		return hash(self.TAG)
 
 
 class PacketMiddleware(BotMiddleware):
 	TAG_DB_OBJECT = 'tag_db_object'
-	TAG_BOT_MESSAGE = 'tag_bot_message'
+	TAG = 'tag_bot_message'
 
-	TAG_CONSUMES = 'tag_raw'
-	TAG_PRODUCES = [TAG_DB_OBJECT, TAG_BOT_MESSAGE]
-
+	TAG_CONSUMES = ['tag_raw']
+	TAG_PRODUCES = [TAG_DB_OBJECT]
+	MIDDLEWARE_REQUIRED = []
 	ENABLED_MESSAGES = [
-		QueueCommand,
-		SkipCommand,
-		ClearQueueCommand,
-		ListQueueCommand,
-		TestSkipCommand,
 		NeonLightShowCommand,
 		HelpCommand,
-		DumpQueueCommand,
-		PlayEvent
 	]
+
+	def __init__(self):
+		super(PacketMiddleware, self).__init__()
+		self.enabled_messages = []
+		self.enabled_messages.extend(self.ENABLED_MESSAGES)
+
+	def request_support(self, request):
+		incompatible_classes = []
+		for _class in request:
+			if hasattr(_class, 'is_this'):
+				self.enabled_messages.append(_class)
+			else:
+				incompatible_classes.append(_class)
+		if incompatible_classes:
+			return incompatible_classes
+		else:
+			return True
 
 	def message_id_exists(self, db, uid):
 		exists = db.search(where('uid') == uid)
@@ -1136,7 +1036,7 @@ class PacketMiddleware(BotMiddleware):
 
 	def create_db_object(self, packet):
 		content = packet.data['content']
-		for event_class in self.ENABLED_MESSAGES:
+		for event_class in self.enabled_messages:
 			if event_class.is_this(content):
 				try:
 					return event_class(packet)
@@ -1146,15 +1046,14 @@ class PacketMiddleware(BotMiddleware):
 
 	@asyncio.coroutine
 	def run(self, db):
-		print('middleware loop running')
 		db_queue = self.output[self.TAG_DB_OBJECT]
-		message_queue = self.output[self.TAG_BOT_MESSAGE]
+		message_queue = self.output[self.TAG]
 		while True:
 			message = yield from self.input.get()
 			print('message: {}'.format(message.data['content']))
 			if message_id_exists(message.uid):
-				if not message.past:
-					print('ignoring {}'.format(message.data['content']))
+				#if not message.past:
+				print('ignoring {}'.format(message.data['content']))
 				self.input.task_done()
 				continue
 			db_object = self.create_db_object(message)
@@ -1165,7 +1064,7 @@ class PacketMiddleware(BotMiddleware):
 						db_object.prepare()
 					except:
 						print('Failed to process: {}'.format(db_object))
-						message_queue.task_done()
+						self.input.task_done()
 						continue
 
 				print('putting in db queue')
@@ -1173,15 +1072,141 @@ class PacketMiddleware(BotMiddleware):
 				print('joining on db queue')
 				yield from db_queue.join()
 
+				if db_object.DB_TAG == HelpCommand.DB_TAG:
+					db_object.set_commands(self.enabled_messages)
+
 				yield from message_queue.put(db_object)
 
 			self.input.task_done()
 
 
+class SimpleActionMiddleware(BotMiddleware):
+	TAG = 'tag_simple_action_middleware'
+	TAG_CONSUMES = [PacketMiddleware.TAG]
+	TAG_PRODUCES = ['tag_do_action']
+
+	@asyncio.coroutine
+	def run(self, db):
+		action_queue = self.output['tag_do_action']
+		while True:
+			command = yield from self.input.get()
+			if hasattr(command, 'get_actions'):
+				for action in command.get_actions():
+					yield from action_queue.put(action)
+
+			self.input.task_done()
+	
+
+class PlayQueuedSongsMiddleware(BotMiddleware):
+	TAG = 'tag_queue_events'
+	TAG_CONSUMES = [PacketMiddleware.TAG]
+	TAG_PRODUCES = ['tag_do_action']
+	MIDDLEWARE_REQUIRED = [PacketMiddleware]
+	MIDDLEWARE_SUPPORT_REQUESTS = {
+		PacketMiddleware.TAG: [
+			QueueCommand,
+			SkipCommand,
+			ClearQueueCommand,
+			ListQueueCommand,
+			TestSkipCommand,
+			DumpQueueCommand,
+			PlayEvent
+		]
+	}
+
+	def __init__(self):
+		super(PlayQueuedSongsMiddleware, self).__init__()
+		self.message_queue = asyncio.JoinableQueue()
+		self.song_queue = []
+		self.current_song = None
+		self.play_callback = None
+
+	def load_state_from_db(self, db):
+		events = db.search(where('type') == PlayEvent.DB_TAG)
+		if events:
+			events = sorted(events, key=lambda x: x['timestamp'])
+			if len(events):
+				event = DBItem.create_object_from_db_entry(events[-1]) 
+				self.current_song = event
+				if self.song_queue:
+					self.play_song(self.current_song.remaining_duration())
+
+	def get_next_songs(self):
+		first = None
+		next = None
+		if len(self.song_queue) > 0:
+			first = self.song_queue[0]
+		if len(self.song_queue) > 1:
+			next = self.song_queue[1]
+
+		return first, next
+
+	@asyncio.coroutine
+	def play_later(self, delay):
+		yield from asyncio.sleep(delay)
+		song_one, song_two = self.get_next_songs()
+		yield from self.action_queue.put(PlayOneSongAction(song_one, song_two))
+
+
+	def play_song(self):
+			if self.play_callback:
+				self.play_callback.cancel()
+
+			delay = 0
+			if self.current_song:
+				delay = self.current_song.remaining_duration()
+
+			print('\tplaying: in {} seconds'.format(delay))
+			self.play_callback = asyncio.get_event_loop().create_task(
+				self.play_later(delay)
+				)
+
+	def handle_queue_command(self, command):
+		print('handle_queue_command: ', command)
+		self.song_queue.append(command)
+		print('\tqueue:', self.song_queue)
+
+	def handle_play_event(self, play):
+		print('handle_play_event: ', play)
+		print('\tqueue:', self.song_queue)
+		self.current_song = play
+		print('new Current Song: {}'.format(play.youtube_info))
+		if self.song_queue and self.song_queue[0].youtube_info == play.youtube_info:
+			print('\tremoving: ', play.youtube_info)
+			self.song_queue.pop(0)
+			print('\tqueue:', self.song_queue)
+
+	@asyncio.coroutine
+	def run(self, db):
+		self.load_state_from_db(db)
+		self.action_queue = self.output['tag_do_action']
+		while True:
+			message = yield from self.input.get()
+
+			if QueueCommand.DB_TAG in message.DB_TAG:
+				self.handle_queue_command(message)
+				yield from self.action_queue.put(QueuedNotificationAction2(self.song_queue, self.current_song, message.youtube_info))
+				self.play_song()
+			elif PlayEvent.DB_TAG in message.DB_TAG:
+				self.handle_play_event(message)
+				self.play_song()
+			elif ClearQueueCommand.DB_TAG in message.DB_TAG:
+				self.song_queue = []
+			elif ListQueueCommand.DB_TAG in message.DB_TAG:
+				print(self.song_queue, self.current_song)
+				action = ListQueueAction(self.song_queue, self.current_song, message.uid)
+				print('sending list action')
+				yield from self.action_queue.put(action)
+			elif DumpQueueCommand.DB_TAG in message.DB_TAG:
+				print('dump queue fixme')
+				pass
+
+
 class NeonDJBot(object):
 	TAG_RAW = 'tag_raw'
+	TAG_DO_ACTION = 'tag_do_action'
 
-	def __init__(self, db, room_address, packet_queue):
+	def __init__(self, db, room_address):
 		self.loop = asyncio.get_event_loop()
 		self.message_queue = asyncio.JoinableQueue()
 		self.database_queue = asyncio.JoinableQueue()
@@ -1197,21 +1222,31 @@ class NeonDJBot(object):
 		self.tasks = []
 		self.mid = 0
 
+		self.reset_mid()
 		### middleware
 
-		self.middleware = set()
+		self.middleware = {}
 		self.queues = {}
-		self.packet_queue = self._get_create_queue(self.TAG_RAW)['producer']
-		self.recieve_messages_for_tag(PacketMiddleware.TAG_BOT_MESSAGE, self.message_queue)
+		self.packet_queue = self.get_input_queue(self.TAG_RAW)
+		self.recieve_messages_for_tag(PacketMiddleware.TAG, self.message_queue)
 		self.recieve_messages_for_tag(PacketMiddleware.TAG_DB_OBJECT, self.database_queue)
+		self.recieve_messages_for_tag(self.TAG_DO_ACTION, self.action_queue)
 
 	def add_middleware(self, middleware):
 		if not middleware in self.middleware:
 			print('adding middleware: ', middleware)
+			for required_middleware in middleware.MIDDLEWARE_REQUIRED:
+				self.add_middleware(required_middleware())
+
 			middleware.register_queues(self)
 			middleware.create_task(self.loop, self.db)
+			for tag, request in middleware.MIDDLEWARE_SUPPORT_REQUESTS.items():
+				result = self.middleware[tag].request_support(request)
+				if result != True:
+					middleware.support_request_failed(tag, result)
+					return
 
-			self.middleware.add(middleware)
+			self.middleware[middleware.TAG] = middleware
 
 
 	def _get_create_queue(self, tag):
@@ -1261,9 +1296,10 @@ class NeonDJBot(object):
 
 	@asyncio.coroutine
 	def setup(self):
+		pass 
 		#yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
-		yield from self.action_queue.put(DebugListCurrentSong())
-		yield from self.action_queue.put(DebugListQueue())
+		#yield from self.action_queue.put(DebugListCurrentSong())
+		#yield from self.action_queue.put(DebugListQueue())
 		#yield from self.action_queue.put(PlayNextQueuedSongAction())
 
 	@asyncio.coroutine
@@ -1281,11 +1317,15 @@ class NeonDJBot(object):
 
 				print('connection succeeded')
 				self.ws_lock.release()
-				#yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
+				yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
 
 			packet = yield from self.ws.recv()
 			if packet:
-				packet = Packet(packet)
+				try:
+					packet = Packet(packet)
+				except:
+					print('Packet {} did not meet expectations! Please investigate!'.format(packet))
+					continue
 
 				if packet.type == 'ping-event':
 					yield from self.action_queue.put(PingAction())
@@ -1316,21 +1356,7 @@ class NeonDJBot(object):
 		return self.db.count(where('uid') == message['uid']) > 0
 
 	@asyncio.coroutine
-	def distribute_messages(self):
-		while True:
-			new_message = yield from self.message_queue.get()
-			#print('sending {} to tasks.'.format(new_message))
-
-			yield from self.database_queue.put(new_message)
-
-			for queue in self.task_queues:
-				# todo: make this a non-blocking call
-				yield from queue.put(new_message)
-
-			self.message_queue.task_done()
-
-	@asyncio.coroutine
-	def add_to_db(self):
+	def add_to_db_task(self):
 		while True:
 			db_item = yield from self.database_queue.get()
 			print('adding {} to DB'.format(db_item))
@@ -1343,117 +1369,17 @@ class NeonDJBot(object):
 			self.database_queue.task_done()	
 
 	def connect(self):
-		message_task = self.loop.create_task(self.distribute_messages())
-		db_task = self.loop.create_task(self.add_to_db())
+		db_task = self.loop.create_task(self.add_to_db_task())
+		action_task = self.loop.create_task(self.execute_actions_task())
 
-		self.internal_coroutines = [message_task, db_task]
+		self.internal_coroutines = [db_task, action_task]
 		self.loop.run_until_complete(self.recv_loop())
 
-#bot = NeonDJBot(db, 'ws://localhost:8765/', message_queue)
-bot = NeonDJBot(db, 'wss://euphoria.io/room/music/ws', message_queue)
-bot.add_middleware(PacketMiddleware())
-bot.add_task(CommandActionTask())
-bot.add_task(PlayQueuedSongsTask())
-#bot.add_task(DebugQueueTask())
+#bot = NeonDJBot(db, 'ws://localhost:8765/')
+#bot = NeonDJBot(db, 'wss://euphoria.io/room/music/ws')
+bot = NeonDJBot(db, 'wss://euphoria.io/room/test/ws')
+bot.add_middleware(SimpleActionMiddleware())
+bot.add_middleware(PlayQueuedSongsMiddleware())
 
-#@asyncio.coroutine
-#def cull_tasks_and_add_to_db():
-	#global state
-	#global bot
-	#while True:
-		#task = yield from task_queue.get()
-		#yield from message_queue.join() # process all messages
-		#yield from bot.database_queue.join() # process all db inserts
-		#events = state['db'].search( where('type').contains(Event.DB_TAG) & (where('timestamp') > task.timestamp)) 
-		#events = [DBItem.create_object_from_db_entry(event) for event in events]
-		#print('Checking Task: {}'.format(task))
-		#satisfied = False
-		#for event in events:
-		#	if task.satisfied_by_event(state, event):
-		#		#print('{} satisfied by {}'.format(task, event))
-		#		for action in task.get_actions():
-		#			yield from bot.action_queue.put(action)
-
-		#		satisfied = True
-		#		break
-		#if not satisfied:
-			#yield from database_queue.put(task.to_db_dict())
-		#	yield from bot.database_queue.put(task)
-
-
-		#task_queue.task_done()
-
-
-#@asyncio.coroutine
-#def queue_command_tasks():
-	#while True:
-		#command = yield from command_task_queue.get()
-		#print('Adding tasks from command: {}'.format(command))
-		#for task in command.get_tasks():
-		#	if not task.is_prepared():
-		#		print('Wont queue un-prepared task: {}'.format(task))
-		#		continue
-		#	
-		#	yield from task_queue.put(task)
-		#command_task_queue.task_done()
-		
-
-@asyncio.coroutine
-def parse_messages():
-	global state
-	global bot
-	while True:
-		message = yield from message_queue.get()
-		print('message: {}'.format(message.data['content']))
-		if message_id_exists(message.uid):
-			if not message.past:
-				print('ignoring {}'.format(message.data['content']))
-			message_queue.task_done()
-			continue
-		db_object = create_db_object(message)
-		if db_object:
-			print('DB Object: {}'.format(db_object))
-			if not db_object.is_prepared():
-				try:
-					db_object.prepare()
-				except:
-					print('Failed to process: {}'.format(db_object))
-					message_queue.task_done()
-					continue
-
-			#print('Adding to DB: {}'.format(db_object))
-			#if Event.DB_TAG in db_object.DB_TAG:
-			#	tasks = db.search(where('type').contains(Task.DB_TAG))
-			#	tasks = [DBItem.create_object_from_db_entry(task) for task in tasks]
-				#print('Checking Event: {}'.format(db_object))
-				#print('Current Tasks: {}'.format(tasks))
-			#	for task in tasks:
-			#		if task.satisfied_by_event(state, db_object):
-						#print('{} satisfied by {}'.format(task, db_object))
-			#			for action in task.get_actions():
-			#				yield from bot.action_queue.put(action)
-			#			break
-
-			#yield from database_queue.put(db_object.to_db_dict())
-			yield from bot.database_queue.put(db_object)
-			#print('database queue size: {}'.format(bot.database_queue.qsize()))
-			yield from bot.database_queue.join()
-
-			#if Command.DB_TAG in db_object.DB_TAG:
-
-				#print('Adding to task queue: {}'.format(db_object))
-			#	yield from command_task_queue.put(db_object)
-
-				#if not message.past:
-					#print('Adding to action queue: {}'.format(db_object))
-					#yield from command_action_queue.put(db_object)
-			yield from bot.message_queue.put(db_object)
-					
-		message_queue.task_done()
-
-
-asyncio.Task(parse_messages())
-#asyncio.Task(queue_command_tasks())
-#asyncio.Task(cull_tasks_and_add_to_db())
 
 bot.connect()
