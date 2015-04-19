@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 import random
 import json
-from time import time
-from datetime import timedelta, datetime
+from time import time, localtime, strftime
+from datetime import timedelta, datetime, tzinfo
 import asyncio
 import websockets
 import re
@@ -46,86 +46,23 @@ class Packet(object):
 	def __str__(self):
 		return '[{}]{}'.format(self.type, self.data)
 
-
-class DBField(object):
-	FIELD_NAME = ""
-
-	# don't touch these
-
-	@classmethod
-	def create_field(cls, db_item, message_or_db):
-		if isinstance(message_or_db, Message):
-			self = cls.create_from_message(message_or_db)
-		else:
-			self = cls.create_from_db_dict(message_or_db[cls.FIELD_NAME])
-		cls._init(db_item, self)
-
-	@classmethod
-	def field_to_db(cls, db_item, db_dict):
-		db_dict[cls.FIELD_NAME] = cls._self(db_item).to_db_dict()
-		return db_dict
-
-	@classmethod
-	def _init(cls, db_item, new_self):
-		setattr(db_item, cls.FIELD_NAME, new_self)
-
-	@classmethod
-	def _self(cls, db_item):
-		if hasattr(db_item, cls.FIELD_NAME):
-			return getattr(db_item, cls.FIELD_NAME)
-		return None
-
-	@classmethod
-	def is_prepared(cls, db_item):
-		self = cls._self(db_item)
-		if self:
-			return self.is_prepared
-		return True
-
-	@classmethod
-	def prepare(cls, db_item):
-		cls._self(db_item).prepare_self()
-		pass
-
-	# override these
-
-	def __init__(self, prepared=True):
-		self.is_prepared = prepared
-
-	@classmethod
-	def create_from_message(cls, message):
-		return {}
-
-	def prepare_self(self):
-		pass
-
-	# single value fields can keep these
-	@classmethod
-	def create_from_db_dict(cls, db_dict):
-		return cls(db_dict)
-
-	def to_db_dict(self):
-		return str(self)
-
-
-
-class User(DBField):
-	FIELD_NAME = "user"
-
+class User(object):
 	@classmethod
 	def create_from_message(cls, message):
 		sender = message.data['sender']
 		return User(sender['id'].split(':')[1], sender['name'])	
 
-	@classmethod
-	def create_from_db_dict(cls, db_dict):
-		return User(db_dict['id'], db_dict['name'])
+	@staticmethod
+	def from_db_dict(db_dict):
+		return User(db_dict['user']['id'], db_dict['user']['name'])
 	
-	def to_db_dict(self):
-		return {
+	def to_db_dict(self, db_dict):
+		db_dict['user'] = {
 			'id': self.user_id,
 			'name': self.name
 		}
+
+		return db_dict
 
 	def __init__(self, user_id, name):
 		super(User, self).__init__()
@@ -138,24 +75,9 @@ class User(DBField):
 	def __str__(self):
 		return self.name
 
-class Parent(DBField):
-	FIELD_NAME = "parent_id"
-
-	@classmethod
-	def create_from_message(cls, message):
-		return Parent(message.data['id'])
-
-	def __init__(self, parent_id):
-		super(Parent, self).__init__()
-		self.parent_id = parent_id
-
-	def __str__(self):
-		return self.parent_id
-
-class YoutubeInfo(DBField):
+class YoutubeInfo(object):
 
 	INFO_URL = 'http://gdata.youtube.com/feeds/api/videos/{}?alt=json'
-	#REGEX = '{}\s*([^\s]+)\s?'
 	REGEX = r'((https?://)?youtube\S+)'
 	FIELD_NAME = 'youtube_info'
 
@@ -166,15 +88,16 @@ class YoutubeInfo(DBField):
 		return YoutubeInfo(urls[0][0])	
 
 	@classmethod
-	def create_from_db_dict(cls, db_dict):
-		self = YoutubeInfo(db_dict['url'])
-		self.set_data(db_dict['youtube_id'],
-			 db_dict['title'], db_dict['sub_title'],
-			 db_dict['thumbnails'], db_dict['duration'])
+	def from_db_dict(cls, db_dict):
+		yt = db_dict['youtube_info']
+		self = YoutubeInfo(yt['url'])
+		self.set_data(yt['youtube_id'],
+			 yt['title'], yt['sub_title'],
+			 yt['thumbnails'], yt['duration'])
 		return self
 
-	def to_db_dict(self):
-		return {
+	def to_db_dict(self, db_dict):
+		db_dict['youtube_info'] = {
 			'url': self.url,
 			'youtube_id': self.youtube_id,
 			'title': self.title,
@@ -182,10 +105,12 @@ class YoutubeInfo(DBField):
 			'thumbnails': self.thumbnails,
 			'duration': self.duration,
 		}
+		return db_dict
 
 	def __init__(self, url):
-		super(YoutubeInfo, self).__init__(prepared=False)
+		super(YoutubeInfo, self).__init__()
 		self.url = url if url.find('http') == 0 else 'https://' + url
+		self.prepared = False
 		
 	def set_data(self,youtube_id, title, sub_title, thumbnails, duration):
 		self.youtube_id = youtube_id
@@ -193,9 +118,10 @@ class YoutubeInfo(DBField):
 		self.sub_title = sub_title
 		self.thumbnails = thumbnails
 		self.duration = duration
-		self.is_prepared = True
+		self.prepared = True
 
-	def prepare_self(self):
+	@asyncio.coroutine
+	def prepare(self):
 		query = urlparse(self.url).query
 		youtube_id = parse_qs(query)['v'][0]
 		url = self.INFO_URL.format(youtube_id)
@@ -208,7 +134,7 @@ class YoutubeInfo(DBField):
 			
 
 	def time_seconds(self):
-		if not self.is_prepared:
+		if not self.prepared:
 			return 0
 		assert(len(self.duration.keys()) == 1)
 		return int(self.duration['seconds'])
@@ -217,7 +143,7 @@ class YoutubeInfo(DBField):
 		return str(timedelta(seconds=self.time_seconds()))
 
 	def select_thumbnail(self):
-		if not self.is_prepared:
+		if not self.prepared:
 			return ''
 		return self.thumbnails[0]['url']
 
@@ -233,7 +159,7 @@ class YoutubeInfo(DBField):
 		return str(self)
 
 	def __str__(self):
-		if not self.is_prepared:
+		if not self.prepared:
 			return self.url
 		else:
 			return '{}|{} [{}]'.format(self.youtube_id, self.title, self.time_string())
@@ -244,40 +170,21 @@ class DBItem(object):
 
 	SUBCLASSES = {}
 
-	CLASS_FIELDS = [User]
-
 	def __init__(self, message_or_db):
 		if isinstance(message_or_db, Message):
 			self.timestamp = message_or_db.timestamp
+			self.user = User.create_from_message(message_or_db)
 			self.uid = message_or_db.uid
 		else:
 			self.timestamp = message_or_db['timestamp']
 			self.uid = message_or_db['uid']
-
-		self.add_fields(self, DBItem.CLASS_FIELDS)
-		self.create_fields(message_or_db)
-
-	@staticmethod
-	def add_fields(self, fields):
-		if not hasattr(self, '_fields'):
-			self._fields = set()
-		for field in fields:
-			self._fields.add(field)
-
-	def create_fields(self, message_or_db):
-		for field in self._fields:
-			field.create_field(self, message_or_db)
+			self.user = User.from_db_dict(message_or_db)
 
 	def prepare(self):
-		for field in self._fields:
-			field.prepare(self)
+		return
 
 	def is_prepared(self):
-		prepared = True
-		for field in self._fields:
-			prepared = prepared and field.is_prepared(self)
-
-		return prepared
+		return True
 
 	def to_db_dict(self):
 		db_dict = {
@@ -285,14 +192,7 @@ class DBItem(object):
 			'uid': self.uid,
 			'timestamp': self.timestamp,
 		}
-
-		return self._fields_to_db_dict(db_dict)
-
-	def _fields_to_db_dict(self, db_dict):
-		for field in self._fields:
-			field.field_to_db(self, db_dict)
-
-		return db_dict
+		return self.user.to_db_dict(db_dict)
 
 	def __lt__(self, other):
 		if hasattr(other, 'timestamp'):
@@ -307,63 +207,8 @@ class DBItem(object):
 		if db_dict['type'] in DBItem.SUBCLASSES:
 			return DBItem.SUBCLASSES[db_dict['type']](db_dict)
 
-class Event(DBItem):
-	DB_TAG = 'database_event'
-	EVENT_TEXT = ''
-
-	def remaining_duration(self):
-		now = datetime.utcnow()
-		event_time = datetime.utcfromtimestamp(self.timestamp)
-		end_time = event_time + self.get_duration()
-		if now > end_time:
-			return 0
-		else:
-			return (end_time - now).seconds
-
-	def is_active(self):
-		now = datetime.utcnow()
-		event_time = datetime.utcfromtimestamp(self.timestamp)
-		end_time = event_time + self.get_duration()
-		return now < end_time
-
-	def get_duration(self):
-		return timedelta(seconds=0)
-
-	def get_duration_int(self):
-		return self.get_duration().seconds
-
-	@classmethod
-	def is_this(cls, message):
-		return cls.EVENT_TEXT in message.lower()
-
-	def __repr__(self):
-		return str(self)
-
-class PlayEvent(Event):
-	DB_TAG = 'database_event_play'
-	EVENT_TEXT = '!play'
-
-	CLASS_FIELDS = [YoutubeInfo]
-
-	def __init__(self, message_or_db):
-		self.add_fields(self, PlayEvent.CLASS_FIELDS)
-		super(PlayEvent, self).__init__(message_or_db)
-
-	def get_duration(self):
-		return timedelta(seconds=(self.youtube_info.time_seconds()) + 3)
-
-	def __repr__(self):
-		return str(self)
-
-	def __str__(self):
-		return '[PlayEvent] {} ({})'.format(self.youtube_info, 'playing' if self.is_active() else 'finished')
-
 
 class Action(object):
-	START_DELAY = 0
-	LOOP_DELAY = 0.2
-	MESSAGE_DELAY = 0
-
 	def __init__(self):
 		self.ws = None
 		self.timestamp = int(time())
@@ -371,39 +216,21 @@ class Action(object):
 	def packet_to_send(self, state):
 		return None
 
-	def actions_to_queue(self, state):
-		return []
-
-	def should_repeat(self, state):
-		return False
-
 	def get_coroutine(self, state, id_generator, action_queue):
 		@asyncio.coroutine
 		def task():
-			yield from asyncio.sleep(self.START_DELAY)
+			message = self.packet_to_send(state)
+			if message:
+				# set id
+				message['id'] = str(next(id_generator))
+				try:
+					yield from self.ws.send(json.dumps(message))
+				except InvalidState:
+					# websocket closed
+					yield from action_queue.put(self)
+				except TypeError:
+					print('{} - Failed to send: {}'.format(self, json.dumps(message)))
 
-			while True:
-				message = self.packet_to_send(state)
-				if message:
-					# set id
-					message['id'] = str(next(id_generator))
-					try:
-						yield from self.ws.send(json.dumps(message))
-					except InvalidState:
-						# websocket closed
-						yield from action_queue.put(self)
-						break
-					except TypeError:
-						print('{} - Failed to send: {}'.format(self, json.dumps(message)))
-						break # bail the hell out
-					yield from asyncio.sleep(self.MESSAGE_DELAY)
-				for action in self.actions_to_queue(state):
-					yield from action_queue.put(action)
-
-				if not self.should_repeat(state):
-					break
-				else:
-					yield from asyncio.sleep(self.LOOP_DELAY)
 
 		return task
 
@@ -464,56 +291,13 @@ class SongAction(PacketAction):
 					return event
 		return None
 
-	def clear_queue(self, db):
-		db.remove(where('type') == PlaySongTask.DB_TAG)
-
-	def queued_songs(self, db):
-		queued_songs = db.search(where('type') == PlaySongTask.DB_TAG)
-		if queued_songs:
-			queued_songs = sorted(queued_songs, key=lambda x: x['timestamp'])
-			return [DBItem.create_object_from_db_entry(song) for song in queued_songs]
-
-		return []
-
 	def skip_count(self, db, seconds):
 		now = int(time())
 		return db.search((where('type') == SkipCommand.DB_TAG) & (where('timestamp') > (now - seconds)) ) 
 
-
 class QueuedNotificationAction(SongAction):
-	def __init__(self, song_info, reply_to = ''):
-		super(QueuedNotificationAction, self).__init__()
-		self.song_info = song_info
-		self.reply_to = reply_to
-
-	def packet_to_send(self, state):
-		queue = self.queued_songs(state['db'])
-		current_song = self.currently_playing(state['db'])
-
-		wait = timedelta(seconds=0)
-		song_string = '{} queued'.format(self.song_info.display())
-		wait_str = 'now.'
-		if current_song:
-			wait = timedelta(seconds=current_song.remaining_duration())
-			wait_str = 'in {}'.format(str(wait))
-		text = '{} first and will be played {}'.format(song_string, wait_str)
-		if queue:
-			position = 1
-			for task in queue:
-				if self.reply_to in task.uid:
-					break
-				wait = wait + timedelta(seconds=task.youtube_info.time_seconds())
-				position += 1
-
-			if position > 1:
-				text = '{} at position [{}] and will be played in {}'.format(song_string, position, str(wait))
-
-
-		return self.send_packet(text, self.reply_to)
-
-class QueuedNotificationAction2(SongAction):
 	def __init__(self, queue, currently_playing, song_info, reply_to = ''):
-		super(QueuedNotificationAction2, self).__init__()
+		super(QueuedNotificationAction, self).__init__()
 		self.song_info = song_info
 		self.reply_to = reply_to
 		self.queue = queue
@@ -543,15 +327,6 @@ class QueuedNotificationAction2(SongAction):
 
 
 		return self.send_packet(text, self.reply_to)
-
-class ClearQueueAction(SongAction):
-	def should_repeat(self, state):
-		self.clear_queue(state['db'])
-
-		return False
-
-	def __str__(self):
-		return 'ClearQueue'
 
 class PlayQueuedSongAction(SongAction):
 	def __init__(self, reply_to=''):
@@ -587,30 +362,6 @@ class PlayQueuedSongAction(SongAction):
 				self.reply_to)
 		return None
 
-class PlayNextQueuedSongAction(PlayQueuedSongAction):
-	START_DELAY = 5
-	MESSAGE_DELAY = 2
-
-	def get_song_to_play(self, state):
-		db = state['db']
-		if not self.currently_playing(db):
-			q = self.queued_songs(db)
-			return q[0] if len(q) > 0 else None, q[1] if len(q) > 1 else None
-
-		return None, None
-
-	def should_repeat(self, state):
-		return True
-
-class SkipCurrentSongAction(PlayQueuedSongAction):
-	def get_song_to_play(self, state):
-		db = state['db']
-		if self.currently_playing(db):
-			q = self.queued_songs(db)
-			return q[0] if len(q) > 0 else None, q[1] if len(q) > 1 else None
-
-		return None, None
-
 class PlayOneSongAction(PlayQueuedSongAction):
 	def __init__(self, song_one=None, song_two=None, reply_to=''):
 		print("playOneSong: {}, {}".format(song_one, song_two))
@@ -620,38 +371,6 @@ class PlayOneSongAction(PlayQueuedSongAction):
 
 	def get_song_to_play(self, state):
 		return self.song_one, self.song_two
-
-class VoteSkipAction(SongAction):
-
-	def should_repeat(self, state):
-		print('skip count:', self.skip_count(state['db'], 60*60))
-		return False
-
-	def process_state(self, state):
-		print('skip count:', self.skip_count(state['db'], 60*60))
-
-
-class DebugListCurrentSong(SongAction):
-	LOOP_DELAY = 1
-
-	def __init__(self):
-		super(DebugListCurrentSong, self).__init__()
-		self.previous_song = None
-
-	def should_repeat(self, state):
-		current_song = self.currently_playing(state['db'])
-		if current_song:
-			if current_song.remaining_duration() < 10:
-				print("Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
-			elif current_song.remaining_duration() % 20 == 0:
-				print("Current song:{}, remaining: {}".format(current_song, current_song.remaining_duration()))
-
-		if current_song != self.previous_song:
-			print("Song change: {} -> {}".format(self.previous_song, current_song))
-
-		self.previous_song = current_song
-
-		return True
 
 class DumpQueue(SongAction):
 	def __init__(self, reply_to=''):
@@ -665,43 +384,6 @@ class DumpQueue(SongAction):
 			strings = []
 			for song in song_queue:
 				strings.append('{} added by @{}\n command(copy & paste w/ !): play {}'.format(str(song.youtube_info.display()), song.user.name, str(song.youtube_info.url)))
-
-			return self.send_packet('\n'.join(strings), self.reply_to)
-
-		return self.send_packet(message, self.reply_to)
-
-class ListQueue(SongAction):
-	def __init__(self, reply_to):
-		super(ListQueue, self).__init__()
-		self.reply_to = reply_to
-
-	def packet_to_send(self, state):
-		song_queue = self.queued_songs(state['db'])
-		current_song = self.currently_playing(state['db'])
-		message = 'Nothing Queued'
-		if song_queue:
-			place = 1
-			total_duration = timedelta(seconds=current_song.remaining_duration())
-			max_duration_width = max(len(str(total_duration)),len('wait time'))
-			max_position_width = 1
-			max_song_title_width = len('song title')
-			for song in song_queue:
-				max_position_width = max(len(str(place)), max_position_width)
-				place += 1
-
-			place = 1
-			time_and_pos_formatting_string = '[{{:^{}}}][{{:^{}}}]'
-			time_format = time_and_pos_formatting_string.format(
-					max_position_width, max_duration_width,
-				)
-			strings = [time_format.format('#', 'wait time')]
-			for song in song_queue:
-				song_string = time_format.format(place, str(total_duration))
-				song_string += ' {} added by [{}]'.format(song.youtube_info.display(), song.user.name)
-				strings.append(song_string)
-
-				place += 1
-				total_duration = total_duration + timedelta(seconds=song.youtube_info.time_seconds())
 
 			return self.send_packet('\n'.join(strings), self.reply_to)
 
@@ -746,23 +428,38 @@ class ListQueueAction(SongAction):
 
 		return self.send_packet(message, self.reply_to)
 
-class DebugListQueue(SongAction):
-	def __init__(self):
-		super(DebugListQueue, self).__init__()
-		self.previous_queue = None
 
-	def should_repeat(self, state):
-		queue = self.queued_songs(state['db'])
-		if queue:
-			queue = ['{} added by {}'.format(str(song.youtube_info), song.user.name) for song in queue]
+class Event(DBItem):
+	DB_TAG = 'database_event'
+	EVENT_TEXT = ''
 
-		if self.previous_queue == None or len(self.previous_queue) != len(queue):
-			print("Current queue:{}".format('\n'.join(queue)))
+	def remaining_duration(self):
+		now = datetime.utcnow()
+		event_time = datetime.utcfromtimestamp(self.timestamp)
+		end_time = event_time + self.get_duration()
+		if now > end_time:
+			return 0
+		else:
+			return (end_time - now).seconds
 
-		self.previous_queue = queue
+	def is_active(self):
+		now = datetime.utcnow()
+		event_time = datetime.utcfromtimestamp(self.timestamp)
+		end_time = event_time + self.get_duration()
+		return now < end_time
 
-		return True
+	def get_duration(self):
+		return timedelta(seconds=0)
 
+	def get_duration_int(self):
+		return self.get_duration().seconds
+
+	@classmethod
+	def is_this(cls, message):
+		return cls.EVENT_TEXT in message.lower()
+
+	def __repr__(self):
+		return str(self)
 
 class Command(DBItem):
 	DB_TAG = 'database_command'
@@ -770,21 +467,24 @@ class Command(DBItem):
 	COMMAND = ''
 	COMMAND_LOCATION = 'any'
 
-	CLASS_FIELDS = [Parent]
-
 	def __init__(self, message_or_db):
-		self.add_fields(self, Command.CLASS_FIELDS)
 		super(Command, self).__init__(message_or_db)
+		if isinstance(message_or_db, Message):
+			self.parent_id = message_or_db.uid
+		else:	
+			self.uid = message_or_db['uid']
 
 	def get_actions(self):
-		return []
-
-	def get_tasks(self):
 		return []
 
 	@classmethod
 	def help_string(cls):
 		return None
+
+	def to_db_dict(self):
+		base = super(Command, self).to_db_dict()
+		base['parent_id'] = self.parent_id
+		return base
 
 	@classmethod
 	def is_this(cls, message):
@@ -800,29 +500,61 @@ class Command(DBItem):
 		return '{}({})'.format(self.DB_TAG, self.user)
 
 
+class PlayEvent(Event):
+	DB_TAG = 'database_event_play'
+	EVENT_TEXT = '!play'
+
+	def __init__(self, message_or_db):
+		super(PlayEvent, self).__init__(message_or_db)
+		if isinstance(message_or_db, Message):
+			self.youtube_info = YoutubeInfo.create_from_message(message_or_db)
+		else:
+			self.youtube_info = YoutubeInfo.from_db_dict (message_or_db)
+
+	def get_duration(self):
+		return timedelta(seconds=(self.youtube_info.time_seconds()) + 3)
+
+	def to_db_dict(self):
+		return self.youtube_info.to_db_dict(super(PlayEvent, self).to_db_dict())
+
+	@asyncio.coroutine
+	def prepare(self):
+		yield from self.youtube_info.prepare()
+
+	def is_prepared(self):
+		return self.youtube_info.prepared
+
+	def __repr__(self):
+		return str(self)
+
+	def __str__(self):
+		return '[PlayEvent] {} ({})'.format(self.youtube_info, 'playing' if self.is_active() else 'finished')
+
 class QueueCommand(Command):
 	DB_TAG = 'database_command_queue'
 	TYPE = 'queue'
 	COMMAND = '!queue'
 	COMMAND_LOCATION = 'start'
 
-	CLASS_FIELDS = [YoutubeInfo]
-
 	def __init__(self, message_or_db):
-		self.add_fields(self, QueueCommand.CLASS_FIELDS)
 		super(QueueCommand, self).__init__(message_or_db)
+		if isinstance(message_or_db, Message):
+			self.youtube_info = YoutubeInfo.create_from_message(message_or_db)
+		else:
+			self.youtube_info = YoutubeInfo.from_db_dict(message_or_db)
 
 	def _generate_confirmation_text(self):
 		return 'Added to queue: {}'.format(self.youtube_info.display())
 
-	def get_actions(self):
-		return []
-		#return [ReplyAction(self._generate_confirmation_text(), str(self.parent_id))]
-		#return [QueuedNotificationAction(self.youtube_info, str(self.parent_id))]
+	def to_db_dict(self):
+		return self.youtube_info.to_db_dict(super(QueueCommand, self).to_db_dict())
 
+	@asyncio.coroutine
+	def prepare(self):
+		yield from self.youtube_info.prepare()
 
-	def get_tasks(self):
-		return [PlaySongTask.new_task(self.user, self.uid+'_1', self.timestamp, fields=[self.youtube_info])]
+	def is_prepared(self):
+		return self.youtube_info.prepared
 
 	@classmethod
 	def help_string(cls):
@@ -836,16 +568,12 @@ class ClearQueueCommand(Command):
 	COMMAND = '!clearqueue'
 	COMMAND_LOCATION = 'start'
 
-	def get_actions(self):
-		return [ClearQueueAction()]
-
 class ListQueueCommand(Command):
 	DB_TAG = 'database_command_listqueue'
 	COMMAND = '!list'
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		#return [ListQueue(str(self.parent_id))]
 		return []
 
 	@classmethod
@@ -858,7 +586,6 @@ class DumpQueueCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		#return [DumpQueue(str(self.parent_id))]
 		return []
 
 	@classmethod
@@ -871,7 +598,6 @@ class SkipCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		#return [SkipCurrentSongAction()]
 		return []
 
 	@classmethod
@@ -884,7 +610,6 @@ class TestSkipCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		#return [VoteSkipAction()]
 		return []
 
 class NeonLightShowCommand(Command):
@@ -930,7 +655,6 @@ DBItem.SUBCLASSES.update({
 		NeonLightShowCommand.DB_TAG: NeonLightShowCommand,
 		HelpCommand.DB_TAG: HelpCommand,
 		DumpQueueCommand.DB_TAG: DumpQueueCommand,
-		PlaySongTask.DB_TAG: PlaySongTask,
 	})
 
 DBItem.SUBCLASSES.update(
@@ -967,6 +691,12 @@ class BotMiddleware(object):
 		self.output = {}
 		self.task = None
 
+	def load_state_from_db(self, db):
+		return
+
+	def save_state_to_db(self, db):
+		return
+
 	def register_queues(self, host):
 		for tag in self.TAG_CONSUMES:
 			host.recieve_messages_for_tag(tag, self.input)
@@ -999,6 +729,60 @@ class BotMiddleware(object):
 
 	def __hash__(self):
 		return hash(self.TAG)
+
+class Log(object):
+	VERBOSE = 0
+	DEBUG = 1
+	WARN = 2
+	ERROR = 3
+	EXCEPTION = 4
+
+	def __init__(self, source='', *args):
+		self.args = args
+		self.level = Log.DEBUG
+		self.file = None
+		self.timestamp = int(time())
+		self.source = source
+
+	def log_str(self):
+		level_string = {self.VERBOSE:'V', self.DEBUG:'D', self.WARN:'W', self.ERROR:'E', self.EXCEPTION:'X'}	
+		timestring = strftime("%m/%d|%H:%M:%S", localtime(self.timestamp))
+		info_string = '[{}][{}][{}]: '.format(timestring, self.source, level_string[self.level])
+		try:
+			arg_string = self.args[0].format(*self.args[1:])
+		except e:
+			arg_string = 'malformed log: {} -> {}'.format(self.args, e)
+
+		return '{} {}'.format(info_string, arg_string)
+
+
+
+class LoggerMiddleware(BotMiddleware):
+	TAG = 'tag_logger_middleware'
+	TAG_CONSUMES = [TAG]
+
+	def __init__(self, default_log = 'Bot.log'):
+		super(LoggerMiddleware, self).__init__()
+		self.log_file_names = [default_log]
+		self.default_file = default_log
+		self.log_files = {}
+
+	def create_files(self):
+		for file_name in self.log_file_names:
+			self.log_files[file_name] = open(file_name, 'a')
+
+	@asyncio.coroutine
+	def run(self, db):
+		self.create_files()
+		while True:
+			log = yield from self.input.get()
+			if isinstance(log, Log):
+				file_name = log.file if log.file else self.default_file
+				fh = self.log_files[file_name]
+				print(log.log_str())
+				fh.write(log.log_str() + '\n')
+
+			self.input.task_done()
 
 
 class PacketMiddleware(BotMiddleware):
@@ -1050,26 +834,26 @@ class PacketMiddleware(BotMiddleware):
 		message_queue = self.output[self.TAG]
 		while True:
 			message = yield from self.input.get()
-			print('message: {}'.format(message.data['content']))
+			#print('message: {}'.format(message.data['content']))
 			if message_id_exists(message.uid):
-				#if not message.past:
-				print('ignoring {}'.format(message.data['content']))
+				if not message.past:
+					print('ignoring {}'.format(message.data['content']))
 				self.input.task_done()
 				continue
 			db_object = self.create_db_object(message)
 			if db_object:
-				print('DB Object: {}'.format(db_object))
+				#print('DB Object: {}'.format(db_object))
 				if not db_object.is_prepared():
 					try:
-						db_object.prepare()
+						yield from db_object.prepare() 
 					except:
 						print('Failed to process: {}'.format(db_object))
 						self.input.task_done()
 						continue
 
-				print('putting in db queue')
+				#print('putting in db queue')
 				yield from db_queue.put(db_object)
-				print('joining on db queue')
+				#print('joining on db queue')
 				yield from db_queue.join()
 
 				if db_object.DB_TAG == HelpCommand.DB_TAG:
@@ -1100,17 +884,11 @@ class SimpleActionMiddleware(BotMiddleware):
 class PlayQueuedSongsMiddleware(BotMiddleware):
 	TAG = 'tag_queue_events'
 	TAG_CONSUMES = [PacketMiddleware.TAG]
-	TAG_PRODUCES = ['tag_do_action']
-	MIDDLEWARE_REQUIRED = [PacketMiddleware]
+	TAG_PRODUCES = ['tag_do_action', LoggerMiddleware.TAG]
+	MIDDLEWARE_REQUIRED = [PacketMiddleware, LoggerMiddleware]
 	MIDDLEWARE_SUPPORT_REQUESTS = {
 		PacketMiddleware.TAG: [
-			QueueCommand,
-			SkipCommand,
-			ClearQueueCommand,
-			ListQueueCommand,
-			TestSkipCommand,
-			DumpQueueCommand,
-			PlayEvent
+			QueueCommand, SkipCommand, ClearQueueCommand, ListQueueCommand, TestSkipCommand, DumpQueueCommand, PlayEvent
 		]
 	}
 
@@ -1120,16 +898,43 @@ class PlayQueuedSongsMiddleware(BotMiddleware):
 		self.song_queue = []
 		self.current_song = None
 		self.play_callback = None
+		# queued a song, waiting to see if it turns up
+		self.expecting_song = False
+
+	def __str__(self):
+		return '\n'.join([
+			'QueueMiddleware:',
+			'\tCurrent Song: {}({}s)'.format(self.current_song, self.current_song.remaining_duration() if self.current_song else 'NaN'),
+			'\tCurrent Queue: {}'.format(self.song_queue)
+			])
 
 	def load_state_from_db(self, db):
+		print('load state from db')
+		saved_state = db.search(where('type') == self.TAG)
+		if saved_state:
+			queue = [db.search(where('uid') == uid)[0] for uid in saved_state[0]['queue']]
+			self.song_queue = [DBItem.create_object_from_db_entry(song) for song in queue]
+			self.song_queue.sort()
+			print('loaded queue: {}'.format(self.song_queue))
 		events = db.search(where('type') == PlayEvent.DB_TAG)
 		if events:
 			events = sorted(events, key=lambda x: x['timestamp'])
 			if len(events):
 				event = DBItem.create_object_from_db_entry(events[-1]) 
 				self.current_song = event
+				print('loded current song: {}'.format(self.current_song))
 				if self.song_queue:
-					self.play_song(self.current_song.remaining_duration())
+					self.play_song()	
+
+	def save_state_to_db(self, db):
+		db_dict = {
+			'type': self.TAG,
+			'queue': [str(item.uid) for item in self.song_queue]
+		}
+		if db.search(where('type') == self.TAG):
+			db.update(db_dict, where('type') == self.TAG)
+		else:
+			db.insert(db_dict)
 
 	def get_next_songs(self):
 		first = None
@@ -1145,8 +950,8 @@ class PlayQueuedSongsMiddleware(BotMiddleware):
 	def play_later(self, delay):
 		yield from asyncio.sleep(delay)
 		song_one, song_two = self.get_next_songs()
+		self.expecting_song = True
 		yield from self.action_queue.put(PlayOneSongAction(song_one, song_two))
-
 
 	def play_song(self):
 			if self.play_callback:
@@ -1155,6 +960,8 @@ class PlayQueuedSongsMiddleware(BotMiddleware):
 			delay = 0
 			if self.current_song:
 				delay = self.current_song.remaining_duration()
+			if self.expecting_song:
+				delay += 3
 
 			print('\tplaying: in {} seconds'.format(delay))
 			self.play_callback = asyncio.get_event_loop().create_task(
@@ -1167,39 +974,43 @@ class PlayQueuedSongsMiddleware(BotMiddleware):
 		print('\tqueue:', self.song_queue)
 
 	def handle_play_event(self, play):
-		print('handle_play_event: ', play)
-		print('\tqueue:', self.song_queue)
 		self.current_song = play
-		print('new Current Song: {}'.format(play.youtube_info))
 		if self.song_queue and self.song_queue[0].youtube_info == play.youtube_info:
-			print('\tremoving: ', play.youtube_info)
 			self.song_queue.pop(0)
-			print('\tqueue:', self.song_queue)
+		#for qcommand in self.song_queue:
+		#	if play.timestamp > qcommand.timestamp:
 
 	@asyncio.coroutine
 	def run(self, db):
-		self.load_state_from_db(db)
+		print(str(self))
 		self.action_queue = self.output['tag_do_action']
+		self.log_q = self.output[LoggerMiddleware.TAG]
 		while True:
 			message = yield from self.input.get()
 
+			yield from self.log_q.put(Log('Queue', 'Got Message: {}', message.DB_TAG))
+			reply_to = message.uid
+
 			if QueueCommand.DB_TAG in message.DB_TAG:
 				self.handle_queue_command(message)
-				yield from self.action_queue.put(QueuedNotificationAction2(self.song_queue, self.current_song, message.youtube_info))
+				yield from self.action_queue.put(QueuedNotificationAction(self.song_queue, self.current_song, message.youtube_info, reply_to))
 				self.play_song()
 			elif PlayEvent.DB_TAG in message.DB_TAG:
+				self.expecting_song = False
 				self.handle_play_event(message)
 				self.play_song()
 			elif ClearQueueCommand.DB_TAG in message.DB_TAG:
 				self.song_queue = []
 			elif ListQueueCommand.DB_TAG in message.DB_TAG:
 				print(self.song_queue, self.current_song)
-				action = ListQueueAction(self.song_queue, self.current_song, message.uid)
-				print('sending list action')
+				action = ListQueueAction(self.song_queue, self.current_song, reply_to)
 				yield from self.action_queue.put(action)
 			elif DumpQueueCommand.DB_TAG in message.DB_TAG:
 				print('dump queue fixme')
 				pass
+
+			self.save_state_to_db(db)
+			yield from self.log_q.put(Log('Queue', str(self)))
 
 
 class NeonDJBot(object):
@@ -1239,6 +1050,7 @@ class NeonDJBot(object):
 				self.add_middleware(required_middleware())
 
 			middleware.register_queues(self)
+			middleware.load_state_from_db(self.db)
 			middleware.create_task(self.loop, self.db)
 			for tag, request in middleware.MIDDLEWARE_SUPPORT_REQUESTS.items():
 				result = self.middleware[tag].request_support(request)
@@ -1297,7 +1109,7 @@ class NeonDJBot(object):
 	@asyncio.coroutine
 	def setup(self):
 		pass 
-		#yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
+		yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
 		#yield from self.action_queue.put(DebugListCurrentSong())
 		#yield from self.action_queue.put(DebugListQueue())
 		#yield from self.action_queue.put(PlayNextQueuedSongAction())
@@ -1317,7 +1129,7 @@ class NeonDJBot(object):
 
 				print('connection succeeded')
 				self.ws_lock.release()
-				yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
+				#yield from self.action_queue.put(SetNickAction("♬|NeonDJBot"))
 
 			packet = yield from self.ws.recv()
 			if packet:
@@ -1359,7 +1171,7 @@ class NeonDJBot(object):
 	def add_to_db_task(self):
 		while True:
 			db_item = yield from self.database_queue.get()
-			print('adding {} to DB'.format(db_item))
+			#print('adding {} to DB'.format(db_item))
 			if hasattr(db_item, 'to_db_dict'):
 				db_dict = db_item.to_db_dict()
 				#if not message_id_exists(db_item['uid']):
