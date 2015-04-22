@@ -174,10 +174,12 @@ class DBItem(object):
 	SUBCLASSES = {}
 
 	def __init__(self, message_or_db):
+		self.backlog = False
 		if isinstance(message_or_db, Message):
 			self.timestamp = message_or_db.timestamp
 			self.user = User.create_from_message(message_or_db)
 			self.uid = message_or_db.uid
+			self.backlog = message_or_db.past
 		else:
 			self.timestamp = message_or_db['timestamp']
 			self.uid = message_or_db['uid']
@@ -249,11 +251,13 @@ class PacketAction(Action):
 
 	@classmethod
 	def send_packet(cls, text, parent_message):
-		return cls._wrap('send', {"content":text,"parent":parent_message})
+		print("Send: {}".format(text))
+		#return cls._wrap('send', {"content":text,"parent":parent_message})
 
 	@classmethod
 	def nick_packet(cls, nick):
-		return cls._wrap('nick', {"name":nick})
+		print("Nick: {}".format(nick))
+		#return cls._wrap('nick', {"name":nick})
 
 class PingAction(PacketAction):
 	def __init__(self):
@@ -758,26 +762,39 @@ class Log(object):
 		self.traceback = None
 		if level == Log.EXCEPTION:
 			self.traceback = traceback.format_exc()
+		else:
+			self.traceback = ''.join(traceback.format_stack())
 			
 		self.file = None
 		self.timestamp = int(time())
 		self.source = source
+
+	def add_traceback(self, log):
+		for line in self.traceback.split('\n'):
+			log += '\n{}'.format(line)
+
+		return log
+
 
 	def log_str(self):
 		level_string = {self.VERBOSE:'V', self.DEBUG:'D', self.WARN:'W', self.ERROR:'E', self.EXCEPTION:'X'}	
 		timestring = strftime("%m/%d|%H:%M:%S", localtime(self.timestamp))
 		info_string = '[{}|{}|{}]: '.format(timestring, self.source, level_string[self.level])
 		try:
-			arg_string = self.args[0].format(*self.args[1:])
+			arg_string = str(self.args[0]).format(*self.args[1:])
 		except Exception as e:
 			arg_string = 'malformed log: {} -> {}'.format(self, e)
+			self.level = Log.EXCEPTION
 
-		full_log = '{} {}'.format(info_string, arg_string)
-		if self.traceback:
-			for line in self.traceback.split('\n'):
-				full_log += '\n{} {}'.format(info_string, line)
+		full_log = arg_string
+		if self.level == Log.EXCEPTION:
+			full_log = self.add_traceback(full_log)
 
-		return full_log
+		log_lines = []
+		for line in full_log.split('\n'):
+			log_lines.append('{} {}'.format(info_string, line))
+
+		return '\n'.join(log_lines)
 
 	def __str__(self):
 		return 'source: {}, level: {}, args: {}'.format(self.source, self.level, self.args)
@@ -828,7 +845,7 @@ class LoggingMiddleware(BotMiddleware):
 		super(LoggingMiddleware, self).load_state_from_db(db)
 		self.log_queue = self.output[LoggerMiddleware.TAG]
 
-	def log(self, level, exception=None, *args):
+	def log(self, level, *args):
 		l = Log(level, self.LOG_NAME, *args)
 		asyncio.async(self._log_coroutine(l))
 
@@ -898,7 +915,7 @@ class PacketMiddleware(LoggingMiddleware):
 				try:
 					return event_class(packet)
 				except:
-					self.error('failed to create: {}', packet.data)
+					self.exception('failed to create: {}', packet.data)
 		return None
 
 	@asyncio.coroutine
@@ -920,11 +937,11 @@ class PacketMiddleware(LoggingMiddleware):
 		self.verbose('message: {}', message.data['content'])
 		db_object = self.create_db_object(message)
 		if db_object:
-			self.debug('DB Object: {}'.format(db_object))
+			self.debug('DB Object: {}', db_object)
 			if not db_object.is_prepared():
 				try:
 					yield from db_object.prepare() 
-				except e:
+				except Exception as e:
 					self.error('Failed to process: {}; Exception: {}', db_object, e)
 					self.input.task_done()
 					return
@@ -980,6 +997,7 @@ class PlayQueuedSongsMiddleware(LoggingMiddleware):
 		self.play_callback = None
 		# queued a song, waiting to see if it turns up
 		self.expecting_song = False
+		self.in_backlog = False
 
 	def __str__(self):
 		return '\n'.join([
@@ -995,14 +1013,14 @@ class PlayQueuedSongsMiddleware(LoggingMiddleware):
 			queue = [db.search(where('uid') == uid)[0] for uid in saved_state[0]['queue']]
 			self.song_queue = [DBItem.create_object_from_db_entry(song) for song in queue]
 			self.song_queue.sort()
-			self.debug('loaded queue: {}'.format(self.song_queue))
+			self.debug('loaded queue: {}', self.song_queue)
 		events = db.search(where('type') == PlayEvent.DB_TAG)
 		if events:
 			events = sorted(events, key=lambda x: x['timestamp'])
 			if len(events):
 				event = DBItem.create_object_from_db_entry(events[-1]) 
 				self.current_song = event
-				self.debug('loded current song: {}'.format(self.current_song))
+				self.debug('loded current song: {}', self.current_song)
 				if self.song_queue:
 					self.play_song()	
 
@@ -1028,8 +1046,17 @@ class PlayQueuedSongsMiddleware(LoggingMiddleware):
 
 	@asyncio.coroutine
 	def play_later(self, delay):
+		song_one, song_two = self.get_next_songs()
+		self.debug("Playing {} in {} seconds.", song_one, delay)
 		yield from asyncio.sleep(delay)
 		song_one, song_two = self.get_next_songs()
+		if not song_one:
+			return
+		while self.in_backlog:
+			self.debug("In backlog messages, holding off on play")
+			# 200ms
+			yield from asyncio.sleep(0.2)
+
 		self.expecting_song = True
 		yield from self.action_queue.put(PlayOneSongAction(song_one, song_two))
 
@@ -1043,7 +1070,6 @@ class PlayQueuedSongsMiddleware(LoggingMiddleware):
 		if self.expecting_song:
 			delay += 3
 
-		self.debug('\tplaying: in {} seconds'.format(delay))
 		self.play_callback = asyncio.get_event_loop().create_task(
 			self.play_later(delay)
 			)
@@ -1075,15 +1101,14 @@ class PlayQueuedSongsMiddleware(LoggingMiddleware):
 
 		self.debug('Got Message: {}', message.DB_TAG)
 		reply_to = message.uid
+		self.in_backlog = message.backlog
 
 		if QueueCommand.DB_TAG in message.DB_TAG:
 			self.handle_queue_command(message)
 			yield from self.action_queue.put(QueuedNotificationAction(self.song_queue, self.current_song, message.youtube_info, reply_to))
-			self.play_song()
 		elif PlayEvent.DB_TAG in message.DB_TAG:
 			self.expecting_song = False
 			self.handle_play_event(message)
-			self.play_song()
 		elif ClearQueueCommand.DB_TAG in message.DB_TAG:
 			self.song_queue = []
 		elif ListQueueCommand.DB_TAG in message.DB_TAG:
@@ -1093,6 +1118,7 @@ class PlayQueuedSongsMiddleware(LoggingMiddleware):
 			self.error('dump queue fixme')
 			pass
 
+		self.play_song()
 		self.save_state_to_db(self.db)
 		self.debug(str(self))
 
@@ -1240,7 +1266,7 @@ class NeonDJBot(object):
 				action.ws = self.ws
 				self.ws_lock.release()
 
-				print('processing action: {}'.format(action))
+				#print('processing action: {}'.format(action))
 				task = action.get_coroutine(self.db, self.mid, self.action_queue)
 				asyncio.async(task())
 
@@ -1272,8 +1298,8 @@ class NeonDJBot(object):
 		self.loop.run_until_complete(self.recv_loop())
 
 #bot = NeonDJBot('ws://localhost:8765/')
-#bot = NeonDJBot('wss://euphoria.io/room/music/ws')
-bot = NeonDJBot('wss://euphoria.io/room/test/ws')
+bot = NeonDJBot('wss://euphoria.io/room/music/ws')
+#bot = NeonDJBot('wss://euphoria.io/room/test/ws')
 bot.add_middleware(SimpleActionMiddleware())
 bot.add_middleware(PlayQueuedSongsMiddleware())
 
