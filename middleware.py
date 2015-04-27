@@ -1,4 +1,5 @@
 import asyncio
+from db_object import DBItem
 from time import time, localtime, strftime
 from core import BotMiddleware, UsesMiddleware, FakeRAWMiddleware, FakeActionMiddleware
 import traceback
