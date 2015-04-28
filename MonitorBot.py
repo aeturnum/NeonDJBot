@@ -21,6 +21,11 @@ class BotMonitorMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 	def git_pull(self):
 		out = subprocess.check_output('git pull', shell=True)
 
+	def kill(self):
+		if self.bot_process:
+			self.bot_process.kill()
+			self.bot_process = None
+
 	def __del__(self):
 		self.bot_process.kill()
 
@@ -29,18 +34,17 @@ class BotMonitorMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 		if packet.type == 'send-event':
 			for message in packet.messages():
 				if message.data['content'].find('!restart') == 0:
-					self.bot_process.kill()
+					self.kill()
 					self.start_process()
 				if message.data['content'].find('!update') == 0:
-					self.bot_process.kill()
+					self.kill()
 					self.git_pull()
 					self.start_process()
 				if message.data['content'].find('!stopbot') == 0:
-					self.bot_process.kill()
+					self.kill()
 					self.bot_process = None
 				if message.data['content'].find('!startbot') == 0:
-					if self.bot_process:
-						self.bot_process.kill()
+					self.kill()
 					self.start_process()
 
 

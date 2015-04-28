@@ -42,13 +42,13 @@ class PacketAction(Action):
 
 	@classmethod
 	def send_packet(cls, text, parent_message):
-		print("Send: {}".format(text))
-		#return cls._wrap('send', {"content":text,"parent":parent_message})
+		#print("Send: {}".format(text))
+		return cls._wrap('send', {"content":text,"parent":parent_message})
 
 	@classmethod
 	def nick_packet(cls, nick):
-		print("Nick: {}".format(nick))
-		#return cls._wrap('nick', {"name":nick})
+		#print("Nick: {}".format(nick))
+		return cls._wrap('nick', {"name":nick})
 
 class PingAction(PacketAction):
 	def __init__(self):

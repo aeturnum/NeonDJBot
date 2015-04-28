@@ -20,7 +20,7 @@ class Bot(object):
 		self.room_address = room_address
 		self.ws_lock = asyncio.Lock()
 		self.ws = None
-		self.db = TinyDB('./MusicBotDB_dev.json')
+		self.db = TinyDB('./MusicBotDB.json')
 		self.internal_coroutines = []
 		self.mid = 0
 
