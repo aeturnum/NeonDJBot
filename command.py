@@ -136,7 +136,11 @@ class NeonLightShowCommand(Command):
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
-		images = ['http://i.imgur.com/eBZO67G.gif', 'http://i.imgur.com/0bprD6k.gif', 'http://i.imgur.com/van2j15.gif', 'http://i.imgur.com/sYjX7Qv.gif']
+		images = [
+		'http://i.imgur.com/eBZO67G.gif', 'http://i.imgur.com/0bprD6k.gif', 'http://i.imgur.com/van2j15.gif', 'http://i.imgur.com/sYjX7Qv.gif',
+		'http://i.imgur.com/sNm4j9n.gif', 'http://i.imgur.com/uXSlR5b.gif', 'http://i.imgur.com/hGSXbsa.gif', 'http://i.imgur.com/UlpqRbK.gif',
+		'http://i.imgur.com/Wmm7EZg.gif', 'http://i.imgur.com/QdYSbbA.gif', 'http://i.imgur.com/Zy5heqF.gif', 'http://i.imgur.com/H4vsVkh.gif'
+		]
 		return [ReplyAction(random.choice(images), str(self.parent_id))]
 
 
