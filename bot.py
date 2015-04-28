@@ -33,12 +33,12 @@ class Bot(object):
 
 	def add_middleware(self, middleware):
 		if not middleware.TAG in self.middleware:
-			print('new middleware: ', middleware)
+			#print('new middleware: ', middleware)
 			for required_middleware in middleware.get_middleware_required():
-				print('adding required middleware: ', required_middleware)
+				#print('adding required middleware: ', required_middleware)
 				self.add_middleware(required_middleware())
 
-			print('indexing middleware: ', middleware)
+			#print('indexing middleware: ', middleware)
 			self.middleware[middleware.TAG] = middleware
 
 			middleware.register_queues(self)
@@ -60,10 +60,10 @@ class Bot(object):
 
 	def get_input_queue(self, tag):
 		if tag == self.TAG_DO_ACTION:
-			print('get_input_queue({}) -> {}'.format(tag, self.action_queue))
+			#print('get_input_queue({}) -> {}'.format(tag, self.action_queue))
 			return self.action_queue
 		else:
-			print('get_input_queue({}) -> {}'.format(tag, self.middleware[tag].input))
+			#print('get_input_queue({}) -> {}'.format(tag, self.middleware[tag].input))
 			if self.middleware[tag].TYPE == BotMiddleware.INPUT:
 				return self.middleware[tag].input
 
@@ -108,9 +108,11 @@ class Bot(object):
 				if packet.type == 'ping-event':
 					yield from self.action_queue.put((self.TAG_DO_ACTION, PingAction()))
 				else:
-					for message in packet.messages():
-						for queue in self.packet_queues:
-							yield from queue.put((self.TAG_RAW, message))
+					for queue in self.packet_queues:
+						yield from queue.put((self.TAG_RAW, packet))
+					#for message in packet.messages():
+					#	for queue in self.packet_queues:
+					#		yield from queue.put((self.TAG_RAW, message))
 
 	@asyncio.coroutine
 	def execute_actions_task(self):

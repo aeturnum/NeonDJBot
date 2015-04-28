@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from db_object import DBItem
 from time import time, localtime, strftime
 from core import BotMiddleware, UsesMiddleware, FakeRAWMiddleware, FakeActionMiddleware
@@ -32,6 +33,7 @@ class Log(object):
 	EXCEPTION = 0
 
 	def __init__(self, level, source='', *args):
+		super(Log, self).__init__()
 		self.args = args
 		self.level = level
 		self.traceback = None
@@ -54,7 +56,7 @@ class Log(object):
 	def log_str(self):
 		level_string = {self.VERBOSE:'V', self.DEBUG:'D', self.WARN:'W', self.ERROR:'E', self.EXCEPTION:'X'}	
 		timestring = strftime("%m/%d|%H:%M:%S", localtime(self.timestamp))
-		info_string = '[{}|{:.4}|{}]:'.format(timestring, self.source, level_string[self.level])
+		info_string = '[{}|{:.4}|{}]'.format(timestring, self.source, level_string[self.level])
 		try:
 			arg_string = str(self.args[0]).format(*self.args[1:])
 		except Exception as e:
@@ -66,8 +68,13 @@ class Log(object):
 			full_log = self.add_traceback(full_log)
 
 		log_lines = []
+		first = True
 		for line in full_log.split('\n'):
-			log_lines.append('{} {}'.format(info_string, line))
+			if first:
+				log_lines.append('{}: {}'.format(info_string, line))
+				first = True
+			else:
+				log_lines.append('{}| {}'.format(info_string, line))
 
 		return '\n'.join(log_lines)
 
@@ -78,8 +85,9 @@ class LoggerMiddleware(BotMiddleware):
 	TAG = 'tag_logger_middleware'
 	TYPE = BotMiddleware.INPUT
 
-	def __init__(self, default_log = 'Bot.log'):
+	def __init__(self):
 		super(LoggerMiddleware, self).__init__()
+		default_log = sys.argv[0].replace('.py', '') + '.log'
 		self.log_file_names = [default_log]
 		self.default_file = default_log
 		self.log_files = {}
@@ -100,6 +108,7 @@ class LoggerMiddleware(BotMiddleware):
 			print(log.log_str())
 			if log.level < Log.VERBOSE:
 				fh.write(log.log_str() + '\n')
+				fh.flush()
 
 class UsesLogger(UsesMiddleware):
 	PRODUCES = LoggerMiddleware
@@ -145,7 +154,11 @@ class SendsActions(UsesMiddleware):
 
 class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 	TAG = 'tag_bot_message'
+	CONTROL_TAG = 'tag_bot_message_control'
 	TYPE = BotMiddleware.OUTPUT
+
+	CONTROL_BACKLOG_START = 'bot_message_backlog_start'
+	CONTROL_BACKLOG_END = 'bot_message_backlog_end'
 
 	LOG_NAME = 'Packet'
 
@@ -192,39 +205,59 @@ class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 			db_dict = db_item.to_db_dict()
 			self.db.insert(db_dict)
 
+	@asyncio.coroutine
+	def send_control_message(self, message):
+		#def _send(queue_list, tag, message):
+		yield from self._send(self._output[self.TAG], self.CONTROL_TAG, message)
 
 	@asyncio.coroutine
-	def handle_event(self, message):
-		if self.message_id_exists(message.uid):
-			if not message.past:
-				self.verbose('ignoring {}', message.data['content'])
-			return
+	def handle_event(self, packet):
+		if packet.type == 'snapshot-event':
+			yield from self.send_control_message(self.CONTROL_BACKLOG_START)
+		for message in packet.messages():
+			if self.message_id_exists(message.uid):
+				if not message.past:
+					self.verbose('ignoring {}', message.data['content'])
+				continue
 
-		#self.verbose('message: {}', message.data['content'])
-		db_object = self.create_db_object(message)
-		if db_object:
-			#self.debug('DB Object: {}', db_object)
-			if not db_object.is_prepared():
-				try:
-					yield from db_object.prepare() 
-				except Exception as e:
-					self.error('Failed to process: {}; Exception: {}', db_object, e)
-					return
+			#self.verbose('message: {}', message.data['content'])
+			db_object = self.create_db_object(message)
+			if db_object:
+				#self.debug('DB Object: {}', db_object)
+				if not db_object.is_prepared():
+					try:
+						yield from db_object.prepare() 
+					except Exception as e:
+						self.error('Failed to process: {}; Exception: {}', db_object, e)
+						continue
 
-			self.save_to_db(db_object)
+				self.save_to_db(db_object)
 
-			if db_object.DB_TAG == HelpCommand.DB_TAG:
-				db_object.set_commands(self.enabled_messages)
+				if db_object.DB_TAG == HelpCommand.DB_TAG:
+					db_object.set_commands(self.enabled_messages)
 
-			yield from self.send(db_object)
+				yield from self.send(db_object)
+		if packet.type == 'snapshot-event':
+			yield from self.send_control_message(self.CONTROL_BACKLOG_END)
 
 class UsesCommands(UsesMiddleware):
 	CONSUMES = PacketMiddleware
 
+	@classmethod
+	def setup_self(cls, self):
+		self._recv_functions[PacketMiddleware.CONTROL_TAG] = self.handle_control_message
+
+	@asyncio.coroutine
+	def handle_control_message(self, message):
+		if message == PacketMiddleware.CONTROL_BACKLOG_START:
+			self.in_backlog = True
+		elif message == PacketMiddleware.CONTROL_BACKLOG_END:
+			self.in_backlog = False
+
 
 class SimpleActionMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsActions):
 	TAG = 'tag_simple_action_middleware'
-	TYPE = BotMiddleware.INPUT
+	TYPE = BotMiddleware.INPUT	
 
 	LOG_NAME = 'Action'
 
@@ -313,9 +346,9 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		self.debug("Playing {} in {} seconds.", song_one, delay)
 		yield from asyncio.sleep(delay)
 		song_one, song_two = self.get_next_songs()
-		if self.in_backlog:
-			self.debug("In backlog messages, holding off on play")
-			yield from asyncio.sleep(5)
+		while self.in_backlog:
+			self.verbose("In backlog messages, holding off on play")
+			yield from asyncio.sleep(0.5)
 
 		self.expecting_song = True
 		yield from self.send_action(PlayOneSongAction(song_one, song_two))
@@ -353,11 +386,12 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 
 	@asyncio.coroutine
 	def handle_event(self, message):
-		self.debug('Got Message: {}', message.DB_TAG)
+		self.verbose('Got Message: {}', message.DB_TAG)
 		reply_to = message.uid
-		self.in_backlog = message.backlog
 
 		action = None
+		if self.current_song and self.current_song.remaining_duration() == 0:
+			self.current_song = None
 
 		if QueueCommand.DB_TAG in message.DB_TAG:
 			self.handle_queue_command(message)
@@ -375,7 +409,7 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 
 		if action:
 			if self.in_backlog:
-				self.debug('In backlog, would have sent: {}', action)
+				self.verbose('In backlog, would have sent: {}', action)
 			else:
 				yield from self.send_action(action)
 

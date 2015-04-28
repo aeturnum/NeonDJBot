@@ -47,17 +47,17 @@ class UsesMiddleware(object):
 	@classmethod
 	def register_queues(cls, self, host):
 		if cls.CONSUMES:
-			print('{}({})::recieve_messages_for_tag[{}]'.format(self, cls, cls.CONSUMES.TAG))
+			#print('{}({})::recieve_messages_for_tag[{}]'.format(self, cls, cls.CONSUMES.TAG))
 			host.recieve_messages_for_tag(cls.CONSUMES.TAG, self.input)
 		if cls.PRODUCES:
-			print('{}({})::get_input_queue[{}]'.format(self, cls, cls.PRODUCES.TAG))
+			#print('{}({})::get_input_queue[{}]'.format(self, cls, cls.PRODUCES.TAG))
 			self.add_output_queue(cls.PRODUCES.TAG,
 				host.get_input_queue(cls.PRODUCES.TAG))
 
 	@classmethod
 	def register_queue_functions(cls, self):
 		if cls.CONSUMES:
-			for tag, function in cls.ROUTES:
+			for tag, function in cls.ROUTES.items():
 				self._recv_functions[tag] = function
 
 		cls.setup_self(self)
@@ -87,9 +87,11 @@ class BotMiddleware(object):
 	MIDDLEWARE_SUPPORT_REQUESTS = {}
 
 	def __init__(self):
+		super(BotMiddleware, self).__init__()
 		self.input = asyncio.JoinableQueue()
 		self._output = {}
 		self.task = None
+		self._finished = False
 		self._recv_functions = {}
 		self._exception_handler = None
 		self._add_routes()
@@ -140,6 +142,9 @@ class BotMiddleware(object):
 		if self.task and not self.task.done():
 			self.task.cancel()
 
+	def close(self):
+		self._finished = True
+
 	@asyncio.coroutine
 	def setup(self, db):
 		self.db = db
@@ -161,11 +166,13 @@ class BotMiddleware(object):
 			try:
 				yield from handler(data)
 			except Exception as e:
-				print('exception')
 				if self._exception_handler:
-					print('handler set!')
 					yield from self._exception_handler(e)
 				pass
+
+			if self._finished:
+				break
+				
 			self.input.task_done()
 
 	@staticmethod
