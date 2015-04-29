@@ -1,4 +1,5 @@
 import asyncio
+from time import time
 from core import Packet, BotMiddleware
 from tinydb import TinyDB
 import websockets
@@ -12,6 +13,8 @@ class Bot(object):
 	TAG_RAW = 'tag_raw'
 	TAG_DO_ACTION = 'tag_do_action'
 
+	RECONNECT_TIMEOUT = 5
+
 	def __init__(self, 	room_address):
 		self.loop = asyncio.get_event_loop()
 		self.action_queue = asyncio.JoinableQueue()
@@ -23,6 +26,7 @@ class Bot(object):
 		self.db = TinyDB('./MusicBotDB.json')
 		self.internal_coroutines = []
 		self.mid = 0
+		self.reconnect_task = None
 
 		self.reset_mid()
 		### middleware
@@ -67,7 +71,6 @@ class Bot(object):
 			if self.middleware[tag].TYPE == BotMiddleware.INPUT:
 				return self.middleware[tag].input
 
-
 	def reset_mid(self):
 		def mid_itr():
 			i = 0
@@ -75,6 +78,17 @@ class Bot(object):
 				yield i
 				i += 1
 		self.mid = mid_itr()
+
+	@asyncio.coroutine
+	def trigger_reconnect(self, delay):
+		yield from asyncio.sleep(delay)
+		self.ws = yield from websockets.connect(self.room_address)
+
+	def set_reconnect_timeout(self, gmt_timestamp):
+		delay = gmt_timestamp - int(time()) + self.RECONNECT_TIMEOUT
+		if self.reconnect_task:
+			self.reconnect_task.cancel()
+		self.reconnect_task = self.loop.create_task(self.trigger_reconnect(delay))
 
 	@asyncio.coroutine
 	def setup(self):
@@ -106,13 +120,11 @@ class Bot(object):
 					continue
 
 				if packet.type == 'ping-event':
+					self.set_reconnect_timeout(packet.data['next'])
 					yield from self.action_queue.put((self.TAG_DO_ACTION, PingAction()))
 				else:
 					for queue in self.packet_queues:
 						yield from queue.put((self.TAG_RAW, packet))
-					#for message in packet.messages():
-					#	for queue in self.packet_queues:
-					#		yield from queue.put((self.TAG_RAW, message))
 
 	@asyncio.coroutine
 	def execute_actions_task(self):

@@ -8,7 +8,9 @@ import traceback
 from actions import (
 	QueuedNotificationAction, 
 	PlayOneSongAction, 
-	ListQueueAction
+	ListQueueAction,
+	DumpQueue,
+	PlayQueueAction
 	)
 
 from tinydb import TinyDB, where
@@ -240,7 +242,7 @@ class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 		if packet.type == 'snapshot-event':
 			yield from self.send_control_message(self.CONTROL_BACKLOG_END)
 
-class UsesCommands(UsesMiddleware):
+class UsesPackets(UsesMiddleware):
 	CONSUMES = PacketMiddleware
 
 	@classmethod
@@ -255,7 +257,7 @@ class UsesCommands(UsesMiddleware):
 			self.in_backlog = False
 
 
-class SimpleActionMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsActions):
+class SimpleActionMiddleware(BotMiddleware, UsesPackets, UsesLogger, SendsActions):
 	TAG = 'tag_simple_action_middleware'
 	TYPE = BotMiddleware.INPUT	
 
@@ -271,9 +273,208 @@ class SimpleActionMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsActio
 		if hasattr(command, 'get_actions'):
 			for action in command.get_actions():
 				yield from self.send_action(action)
-	
 
-class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsActions):
+
+class QueueUpdate(object):
+	NEW_SONGS = 'queue_update_type_new_songs'
+	SONGS_REMOVED = 'queue_update_type_removed_songs'
+
+	def __init__(self, queue, old_queue):
+		self.queue = queue
+		if len(queue > old_queue):
+			self.type = self.NEW_SONGS
+			self.change = list(set(queue) - set(old_queue))
+		else:
+			self.type = self.SONGS_REMOVED
+			self.change = list(set(old_queue) - set(queue))
+
+class QueueMiddleware(BotMiddleware, UsesPackets, UsesLogger, SendsActions):
+	TAG = 'tag_queue_status'
+	TYPE = BotMiddleware.OUTPUT
+
+	LOG_NAME = 'Q_Mgr'
+	MIDDLEWARE_SUPPORT_REQUESTS = {
+		PacketMiddleware.TAG: [
+			QueueCommand, SkipCommand, ClearQueueCommand, ListQueueCommand, DumpQueueCommand
+		]
+	}
+
+	def __init__(self):
+		super(PlayQueuedSongsMiddleware, self).__init__()
+		self.song_queue = []
+		UsesCommands.set_handler(self, self.handle_event)
+
+	def load_state_from_db(self, db):
+		super(QueueMiddleware, self).load_state_from_db(db)
+		self.debug('load state from db')
+		saved_state = db.search(where('type') == self.TAG)
+		if saved_state:
+			queue = [db.search(where('uid') == uid)[0] for uid in saved_state[0]['queue']]
+			self.song_queue = [DBItem.create_object_from_db_entry(song) for song in queue]
+			self.song_queue.sort()
+			self.debug('loaded queue: {}', self.song_queue)
+
+	def save_state_to_db(self, db):
+		db_dict = {
+			'type': self.TAG,
+			'queue': [str(item.uid) for item in self.song_queue]
+		}
+		if db.search(where('type') == self.TAG):
+			db.update(db_dict, where('type') == self.TAG)
+		else:
+			db.insert(db_dict)
+
+	@asyncio.coroutine
+	def handle_event(self, message):
+		self.verbose('Got Message: {}', message.DB_TAG)
+		reply_to = message.uid
+
+		action = None
+
+		if QueueCommand.DB_TAG in message.DB_TAG:
+			old_queue = self.song_queue
+			self.song_queue.append(message)
+			yield from self.send(QueueUpdate(self.song_queue, old_queue))
+			#action = QueuedNotificationAction(self.song_queue, self.current_song, message.youtube_info, reply_to)
+		elif ClearQueueCommand.DB_TAG in message.DB_TAG:
+			yield from self.send(QueueUpdate(self.song_queue, []]))
+			self.song_queue = []
+		elif ListQueueCommand.DB_TAG in message.DB_TAG:
+			action = ListQueueAction(self.song_queue, self.current_song, reply_to)
+		elif DumpQueueCommand.DB_TAG in message.DB_TAG:
+			action = DumpQueue(self.song_queue)
+			yield from self.send(QueueUpdate(self.song_queue, []))
+			self.song_queue = []
+
+		if action:
+			if self.in_backlog:
+				self.verbose('In backlog, would have sent: {}', action)
+			else:
+				yield from self.send_action(action)
+
+		self.save_state_to_db(self.db)
+		#self.debug(self.status_string())
+
+class UsesQueue(UsesMiddleware):
+	CONSUMES = QueueMiddleware
+
+class SongEvent(object):
+	def __init__(self, song, user, start_time, end_time):
+		self.song = song
+		self.user = user
+		self.start = start_time
+		self.end = end_time
+
+	def remaining_duration(self):
+		return self.end - int(time())
+
+	def duration(self):
+		return self.end = self.start
+
+class SongPlaying(SongEvent):
+	pass
+
+class SongEnded(SongEvent):
+	def __init__(self, song):
+		super(SongEnded, self).__init__(
+			song.song, song.user,
+			song.start_time, int(time())
+			)
+
+
+class NowPlayingMiddleware(BotMiddleware, UsesPackets, UsesLogger):
+	TAG = 'tag_now_playing_middleware'
+	TYPE = BotMiddleware.OUTPUT
+
+	LOG_NAME = 'NowPlaying'
+	MIDDLEWARE_SUPPORT_REQUESTS = {
+		PacketMiddleware.TAG: [
+			PlayEvent
+		]
+	}
+
+	def __init__(self):
+		super(NowPlayingMiddleware, self).__init__()
+		self.song_ended_task = None
+		UsesPackets.set_handler(self, self.handle_event)
+
+	def load_state_from_db(self, db):
+		super(NowPlayingMiddleware, self).load_state_from_db(db)
+		events = db.search(where('type') == PlayEvent.DB_TAG)
+		if events:
+			events = sorted(events, key=lambda x: x['timestamp'])
+			event = DBItem.create_object_from_db_entry(events[-1]) 
+			if event.is_active():
+				self.current_song = self.create_song_playing(event)
+			self.debug('loded current song: {}', self.current_song)
+
+	def create_song_playing(self, play_event):
+		return SongPlaying(
+			play_event.youtube_info,
+			play_event.user,
+			play_event.timestamp,
+			play_event.timestamp + play_event.remaining_duration())
+
+	@asyncio.coroutine
+	def send_song_ended(self, song):
+		yield from asyncio.sleep(song.remaining_duration())
+		print('sending scheduled end song: ', SongEnded(self.current_song))
+		yield from self.send(SongEnded(song))
+
+
+	def schedule_song_ended(self):
+		if self.song_ended_task:
+			self.song_ended_task.cancel()
+		self.song_ended_task = asyncio.get_event_loop().create_task(
+			self.send_song_ended(self.current_song)
+			)
+
+	@asyncio.coroutine
+	def handle_event(self, event):
+		if PlayEvent.DB_TAG in event.DB_TAG:
+			if self.current_song:
+				print('sending end song: ', SongEnded(self.current_song))
+				yield from self.send(SongEnded(self.current_song))
+			self.current_song = self.create_song_playing(event)
+			self.schedule_song_ended()
+			print('sending current song: ', self.current_song)
+			yield from self.senf(self.current_song)
+
+class UsesNowPlaying(UsesMiddleware):
+	CONSUMES = NowPlayingMiddleware
+
+class PlayQueuedSongsMiddleware(BotMiddleware, UsesNowPlaying, UsesQueue, UsesLogger, SendsActions):
+	TAG = 'tag_play_queued_songs'
+	TYPE = BotMiddleware.OUTPUT	
+
+	LOG_NAME = 'PlaySong'
+
+	def __init__(self):
+		super(NowPlayingMiddleware, self).__init__()
+		self.queue = []
+		self.current_song = None
+		UsesNowPlaying.set_handler(self, self.handle_songs)
+		UsesQueue.set_handler(self, self.handle_queues)
+
+	@asyncio.coroutine
+	def handle_songs(self, song):
+		if type(song) is SongPlaying:
+			self.current_song = song
+		elif type(song) is SongEnded:
+			yield from self.send_action(PlayQueueAction(self.queue))
+
+	@asyncio.coroutine
+	def handle_queues(self, queue):
+
+		if self.queue != queue:
+
+		self.queue = queue.queue
+
+
+
+
+
+class PlayQueuedSongsMiddleware(BotMiddleware, UsesPackets, UsesLogger, SendsActions):
 	TAG = 'tag_queue_events'
 	TYPE = BotMiddleware.OUTPUT
 
@@ -286,14 +487,13 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 
 	def __init__(self):
 		super(PlayQueuedSongsMiddleware, self).__init__()
-		self.message_queue = asyncio.JoinableQueue()
 		self.song_queue = []
 		self.current_song = None
 		self.play_callback = None
 		# queued a song, waiting to see if it turns up
 		self.expecting_song = False
 		self.in_backlog = False
-		UsesCommands.set_handler(self, self.handle_event)
+		UsesPackets.set_handler(self, self.handle_event)
 
 	def status_string(self):
 		return '\n'.join([
@@ -404,8 +604,7 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		elif ListQueueCommand.DB_TAG in message.DB_TAG:
 			action = ListQueueAction(self.song_queue, self.current_song, reply_to)
 		elif DumpQueueCommand.DB_TAG in message.DB_TAG:
-			self.error('dump queue fixme')
-			pass
+			action = DumpQueue(self.song_queue)
 
 		if action:
 			if self.in_backlog:

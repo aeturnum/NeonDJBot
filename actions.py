@@ -42,13 +42,13 @@ class PacketAction(Action):
 
 	@classmethod
 	def send_packet(cls, text, parent_message):
-		#print("Send: {}".format(text))
-		return cls._wrap('send', {"content":text,"parent":parent_message})
+		print("Send: {}".format(text))
+		#return cls._wrap('send', {"content":text,"parent":parent_message})
 
 	@classmethod
 	def nick_packet(cls, nick):
-		#print("Nick: {}".format(nick))
-		return cls._wrap('nick', {"name":nick})
+		print("Nick: {}".format(nick))
+		#return cls._wrap('nick', {"name":nick})
 
 class PingAction(PacketAction):
 	def __init__(self):
@@ -165,13 +165,24 @@ class PlayOneSongAction(PlayQueuedSongAction):
 	def get_song_to_play(self, db):
 		return self.song_one, self.song_two
 
+class PlayQueueAction(PlayQueuedSongAction):
+	def __init__(self, queue, reply_to=''):
+		song_one = None
+		song_two = None
+		if len(queue) > 0:
+			song_one = queue[0]
+		if len(queue) > 1:
+			song_two = queue[0]
+		super(PlayOneSongAction, self).__init__(song_one, song_two, reply_to)
+
 class DumpQueue(SongAction):
-	def __init__(self, reply_to=''):
+	def __init__(self, queue, reply_to=''):
 		super(DumpQueue, self).__init__()
 		self.reply_to = reply_to
+		self.queue = queue
 
 	def packet_to_send(self, db):
-		song_queue = self.queued_songs(db)
+		song_queue = self.queued
 		message = 'Nothing Queued'
 		if song_queue:
 			strings = []
