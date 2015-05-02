@@ -1,9 +1,6 @@
 import asyncio
-import sys
 from db_object import DBItem
-from time import time, localtime, strftime
-from core import BotMiddleware, UsesMiddleware, FakeRAWMiddleware, FakeActionMiddleware
-import traceback
+from core import BotMiddleware, UsesMiddleware, FakeRAWMiddleware, FakeActionMiddleware, LoggerMiddleware, Log, UsesLogger
 
 from actions import (
 	QueuedNotificationAction, 
@@ -24,122 +21,6 @@ from command import (
 	HelpCommand, 
 	DumpQueueCommand
 	)
-
-class Log(object):
-	VERBOSE = 4
-	DEBUG = 3
-	WARN = 2
-	ERROR = 1
-	EXCEPTION = 0
-
-	def __init__(self, level, source='', *args):
-		super(Log, self).__init__()
-		self.args = args
-		self.level = level
-		self.traceback = None
-		if level == Log.EXCEPTION:
-			self.traceback = traceback.format_exc()
-		else:
-			self.traceback = ''.join(traceback.format_stack())
-			
-		self.file = None
-		self.timestamp = int(time())
-		self.source = source
-
-	def add_traceback(self, log):
-		for line in self.traceback.split('\n'):
-			log += '\n{}'.format(line)
-
-		return log
-
-
-	def log_str(self):
-		level_string = {self.VERBOSE:'V', self.DEBUG:'D', self.WARN:'W', self.ERROR:'E', self.EXCEPTION:'X'}	
-		timestring = strftime("%m/%d|%H:%M:%S", localtime(self.timestamp))
-		info_string = '[{}|{:.4}|{}]'.format(timestring, self.source, level_string[self.level])
-		try:
-			arg_string = str(self.args[0]).format(*self.args[1:])
-		except Exception as e:
-			arg_string = 'malformed log: {} -> {}'.format(self, e)
-			self.level = Log.EXCEPTION
-
-		full_log = arg_string
-		if self.level == Log.EXCEPTION:
-			full_log = self.add_traceback(full_log)
-
-		log_lines = []
-		first = True
-		for line in full_log.split('\n'):
-			if first:
-				log_lines.append('{}: {}'.format(info_string, line))
-				first = True
-			else:
-				log_lines.append('{}| {}'.format(info_string, line))
-
-		return '\n'.join(log_lines)
-
-	def __str__(self):
-		return 'source: {}, level: {}, args: {}'.format(self.source, self.level, self.args)
-
-class LoggerMiddleware(BotMiddleware):
-	TAG = 'tag_logger_middleware'
-	TYPE = BotMiddleware.INPUT
-
-	def __init__(self):
-		super(LoggerMiddleware, self).__init__()
-		default_log = sys.argv[0].replace('.py', '') + '.log'
-		self.log_file_names = [default_log]
-		self.default_file = default_log
-		self.log_files = {}
-
-	def create_files(self):
-		for file_name in self.log_file_names:
-			self.log_files[file_name] = open(file_name, 'a')
-
-	def load_state_from_db(self, db):
-		super(LoggerMiddleware, self).load_state_from_db(db)
-		self.create_files()
-
-	@asyncio.coroutine
-	def handle_event(self, log):
-		if isinstance(log, Log):
-			file_name = log.file if log.file else self.default_file
-			fh = self.log_files[file_name]
-			print(log.log_str())
-			if log.level < Log.VERBOSE:
-				fh.write(log.log_str() + '\n')
-				fh.flush()
-
-class UsesLogger(UsesMiddleware):
-	PRODUCES = LoggerMiddleware
-	LOG_NAME = ''
-
-	@classmethod
-	def setup_self(cls, self):
-		self._exception_handler = self.handle_exception
-
-	def log(self, level, *args):
-		l = Log(level, self.LOG_NAME, *args)
-		asyncio.async(
-			self.send(l, tag=LoggerMiddleware.TAG)
-			)
-
-	def exception(self, *args):
-		return self.log(Log.EXCEPTION, *args)
-
-	def error(self, *args):
-		return self.log(Log.ERROR, *args)
-
-	def debug(self, *args):
-		return self.log(Log.DEBUG, *args)
-
-	def verbose(self, *args):
-		return self.log(Log.VERBOSE, *args)
-
-	@asyncio.coroutine
-	def handle_exception(self, e):
-		self.exception('Caught exception in {}.loop: {}', self.__class__, e)
-		yield from asyncio.sleep(1)
 
 class UsesRaw(UsesMiddleware):
 	CONSUMES = FakeRAWMiddleware

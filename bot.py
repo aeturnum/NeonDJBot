@@ -1,5 +1,6 @@
 import asyncio
-from core import Packet, BotMiddleware
+from time import time
+from core import Packet, BotMiddleware, LoggerMiddleware, Log
 from tinydb import TinyDB
 import websockets
 
@@ -12,6 +13,8 @@ class Bot(object):
 	TAG_RAW = 'tag_raw'
 	TAG_DO_ACTION = 'tag_do_action'
 
+	RECONNECT_TIMEOUT = 5
+
 	def __init__(self, 	room_address):
 		self.loop = asyncio.get_event_loop()
 		self.action_queue = asyncio.JoinableQueue()
@@ -23,6 +26,7 @@ class Bot(object):
 		self.db = TinyDB('./MusicBotDB.json')
 		self.internal_coroutines = []
 		self.mid = 0
+		self.reconnect_task = None
 
 		self.reset_mid()
 		### middleware
@@ -30,6 +34,9 @@ class Bot(object):
 		self.middleware = {}
 		self.queues = {}
 		self.packet_queues = []
+
+		self.add_middleware(LoggerMiddleware())
+		self.log_queue = self.get_input_queue(LoggerMiddleware.TAG)
 
 	def add_middleware(self, middleware):
 		if not middleware.TAG in self.middleware:
@@ -48,7 +55,7 @@ class Bot(object):
 				result = self.middleware[tag].request_support(request)
 				if result != True:
 					middleware.support_request_failed(tag, result)
-					print('middleware request for support failed: {} -> {}'.format(middleware, tag))
+					self.error('middleware request for support failed: {} -> {}'.format(middleware, tag))
 					return
 
 	def recieve_messages_for_tag(self, tag, queue):
@@ -67,7 +74,6 @@ class Bot(object):
 			if self.middleware[tag].TYPE == BotMiddleware.INPUT:
 				return self.middleware[tag].input
 
-
 	def reset_mid(self):
 		def mid_itr():
 			i = 0
@@ -75,6 +81,48 @@ class Bot(object):
 				yield i
 				i += 1
 		self.mid = mid_itr()
+
+	#do doo do, poor engineering practices
+	# copied and pasted from logging middleware because I am a bad person
+	@asyncio.coroutine
+	def log(self, level, *args):
+		l = Log(level, 'BOT', *args)
+		yield from self.log_queue.put((LoggerMiddleware.TAG ,l))
+
+	def exception(self, *args):
+		asyncio.async(self.log(Log.EXCEPTION, *args))
+
+	def error(self, *args):
+		asyncio.async(self.log(Log.ERROR, *args))
+
+	def debug(self, *args):
+		asyncio.async(self.log(Log.DEBUG, *args))
+
+	def verbose(self, *args):
+		asyncio.async(self.log(Log.VERBOSE, *args))
+
+	@asyncio.coroutine
+	def trigger_reconnect(self, delay):
+		yield from asyncio.sleep(delay)
+		self.debug('Server ping is overdue, triggering re-connect')
+		try:
+			self.ws = yield from websockets.connect(self.room_address)
+		except:
+			self.error("Reconnect failed, sleeping for 10 seconds and trying again!")
+			# like violence, if it doesn't work, apply more
+			self.reconnect_task = self.loop.create_task(self.trigger_reconnect(10))
+
+
+	def set_reconnect_timeout(self, ping_packet):
+		now = int(time())
+		latency = now - ping_packet.data['time']
+		self.debug('Current latency from server: {}', latency)
+		# delay before reconnect is equal to next - now
+		# plus timeout and travel time
+		delay = (ping_packet.data['next'] - now) + (self.RECONNECT_TIMEOUT + latency)
+		if self.reconnect_task:
+			self.reconnect_task.cancel()
+		self.reconnect_task = self.loop.create_task(self.trigger_reconnect(delay))
 
 	@asyncio.coroutine
 	def setup(self):
@@ -89,11 +137,11 @@ class Bot(object):
 				try:
 					self.ws = yield from websockets.connect(self.room_address)
 				except:
-					print('connection failed')
+					self.debug('connection failed')
 					yield from asyncio.sleep(1)
 					continue
 
-				print('connection succeeded')
+				self.debug('connection succeeded')
 				self.ws_lock.release()
 				yield from self.setup()
 
@@ -102,17 +150,16 @@ class Bot(object):
 				try:
 					packet = Packet(packet)
 				except:
-					print('Packet {} did not meet expectations! Please investigate!'.format(packet))
+					self.error('Packet {} did not meet expectations! Please investigate!'.format(packet))
 					continue
+				#self.verbose('Packet type: {}', packet.type)
 
 				if packet.type == 'ping-event':
+					self.set_reconnect_timeout(packet)
 					yield from self.action_queue.put((self.TAG_DO_ACTION, PingAction()))
 				else:
 					for queue in self.packet_queues:
 						yield from queue.put((self.TAG_RAW, packet))
-					#for message in packet.messages():
-					#	for queue in self.packet_queues:
-					#		yield from queue.put((self.TAG_RAW, message))
 
 	@asyncio.coroutine
 	def execute_actions_task(self):
