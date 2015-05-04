@@ -109,10 +109,11 @@ class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 					try:
 						yield from db_object.prepare() 
 					except Exception as e:
-						self.error('Failed to process: {}; Exception: {}', db_object, e)
-						continue
-
-				self.save_to_db(db_object)
+						self.debug('Failed to process: {}; Exception: {}', db_object, e)
+				
+				# only record objects that are sucessfully prepared to the db
+				if db_object.is_prepared():
+					self.save_to_db(db_object)
 
 				if db_object.DB_TAG == HelpCommand.DB_TAG:
 					db_object.set_commands(self.enabled_messages)
@@ -149,7 +150,7 @@ class SimpleActionMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsActio
 
 	@asyncio.coroutine
 	def handle_event(self, command):
-		if hasattr(command, 'get_actions'):
+		if hasattr(command, 'get_actions') and not self.in_backlog:
 			for action in command.get_actions():
 				yield from self.send_action(action)
 	
@@ -267,6 +268,9 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 
 	@asyncio.coroutine
 	def handle_event(self, message):
+		if not message.is_prepared():
+			return
+
 		self.verbose('Got Message: {}', message.DB_TAG)
 		reply_to = message.uid
 

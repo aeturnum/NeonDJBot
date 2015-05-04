@@ -19,7 +19,7 @@ class Command(DBItem):
 		super(Command, self).__init__(message_or_db)
 		if isinstance(message_or_db, Message):
 			self.parent_id = message_or_db.uid
-		else:	
+		else:
 			self.uid = message_or_db['uid']
 
 	def get_actions(self):
@@ -63,6 +63,12 @@ class QueueCommand(Command):
 
 	def _generate_confirmation_text(self):
 		return 'Added to queue: {}'.format(self.youtube_info.display())
+
+	def get_actions(self):
+		if not self.youtube_info.prepared:
+			return [ReplyAction("Sorry, I could not find a youtube url in your command. I can't understand anything other than 'youtube.com/watch?v=...' links (including youtu.be).", self.parent_id)]
+		else:
+			return []
 
 	def to_db_dict(self):
 		return self.youtube_info.to_db_dict(super(QueueCommand, self).to_db_dict())
@@ -153,7 +159,7 @@ class HelpCommand(Command):
 		self.commands = commands
 
 	def get_help_lines(self):
-		lines = []
+		lines = ['Commands with help text:']
 		for command in self.commands:
 			if hasattr(command, 'help_string') and command.help_string():
 				lines.append(command.help_string())

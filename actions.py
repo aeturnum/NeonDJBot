@@ -142,7 +142,7 @@ class PlayQueuedSongAction(SongAction):
 			next = cls.song_message(next_song)
 		return '{}\n!play {}\nNext: {}'.format(
 			cls.song_message(song_to_play),
-			song_to_play.youtube_info.url,
+			song_to_play.youtube_info.get_play_url(),
 			next)
 
 	def get_song_to_play(self, db):
@@ -176,7 +176,7 @@ class DumpQueue(SongAction):
 		if song_queue:
 			strings = []
 			for song in song_queue:
-				strings.append('{} added by @{}\n command(copy & paste w/ !): play {}'.format(str(song.youtube_info.display()), song.user.name, str(song.youtube_info.url)))
+				strings.append('{} added by @{}\n command(copy & paste w/ !): play {}'.format(str(song.youtube_info.display()), song.user.name, str(song.youtube_info.get_play_url())))
 
 			return self.send_packet('\n'.join(strings), self.reply_to)
 

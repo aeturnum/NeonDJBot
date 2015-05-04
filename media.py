@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 class YoutubeInfo(object):
 
 	INFO_URL = 'http://gdata.youtube.com/feeds/api/videos/{}?alt=json'
+	PLAY_URL = 'https://www.youtube.com/watch?v={id}'
 	REGEX = r'((https?://)?youtube\S+)'
 
 	@classmethod
@@ -43,7 +44,9 @@ class YoutubeInfo(object):
 
 	def __init__(self, url):
 		super(YoutubeInfo, self).__init__()
-		self.url = url if url.find('http') == 0 else 'https://' + url
+		self.url = None
+		if url:
+			self.url = url if url.find('http') == 0 else 'https://' + url
 		self.prepared = False
 		
 	def set_data(self,youtube_id, title, sub_title, thumbnails, duration):
@@ -56,6 +59,8 @@ class YoutubeInfo(object):
 
 	@asyncio.coroutine
 	def prepare(self):
+		if not self.url:
+			return
 		query = urlparse(self.url).query
 		youtube_id = parse_qs(query)['v'][0]
 		url = self.INFO_URL.format(youtube_id)
@@ -73,6 +78,12 @@ class YoutubeInfo(object):
 			return 0
 		assert(len(self.duration.keys()) == 1)
 		return int(self.duration['seconds'])
+
+	def get_play_url(self):
+		if self.prepared:
+			return self.PLAY_URL.format(id=self.youtube_id)
+		else:
+			return self.url
 
 	def time_string(self):
 		return str(timedelta(seconds=self.time_seconds()))
