@@ -27,6 +27,8 @@ class Bot(object):
 		self.internal_coroutines = []
 		self.mid = 0
 		self.reconnect_task = None
+		self.last_latency = None
+		self.last_ping_log = int(time())
 
 		self.reset_mid()
 		### middleware
@@ -103,6 +105,9 @@ class Bot(object):
 
 	@asyncio.coroutine
 	def trigger_reconnect(self, delay):
+		if int(time()) - self.last_ping_log > 60*10:
+			self.last_ping_log = int(time())
+			self.debug('Server ping must be recieved in {} seconds or will trigger re-connect.', delay)
 		yield from asyncio.sleep(delay)
 		self.debug('Server ping is overdue, triggering re-connect')
 		try:
@@ -116,7 +121,9 @@ class Bot(object):
 	def set_reconnect_timeout(self, ping_packet):
 		now = int(time())
 		latency = now - ping_packet.data['time']
-		self.debug('Current latency from server: {}', latency)
+		if latency != self.last_latency:
+			self.debug('Current latency from server: {}', latency)
+			self.last_latency = latency
 		# delay before reconnect is equal to next - now
 		# plus timeout and travel time
 		delay = (ping_packet.data['next'] - now) + (self.RECONNECT_TIMEOUT + latency)
