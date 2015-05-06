@@ -19,14 +19,17 @@ class Bot(object):
 		self.loop = asyncio.get_event_loop()
 		self.action_queue = asyncio.JoinableQueue()
 		self.packet_queue = asyncio.JoinableQueue()
+		self.ws_queue = asyncio.JoinableQueue()
+
+		self.action_task = None
+		self.recv_task = None
 
 		self.room_address = room_address
-		self.ws_lock = asyncio.Lock()
 		self.ws = None
 		self.db = TinyDB('./MusicBotDB.json')
-		self.internal_coroutines = []
 		self.mid = 0
-		self.reconnect_task = None
+
+		self.next_ping_time = int(time()) 
 		self.last_latency = None
 		self.last_ping_log = int(time())
 
@@ -103,22 +106,60 @@ class Bot(object):
 	def verbose(self, *args):
 		asyncio.async(self.log(Log.VERBOSE, *args))
 
+
 	@asyncio.coroutine
-	def trigger_reconnect(self, delay):
-		if int(time()) - self.last_ping_log > 60*10:
-			self.last_ping_log = int(time())
-			self.debug('Server ping must be recieved in {} seconds or will trigger re-connect.', delay)
-		yield from asyncio.sleep(delay)
-		self.debug('Server ping is overdue, triggering re-connect')
-		try:
-			self.ws = yield from websockets.connect(self.room_address)
-		except:
-			self.error("Reconnect failed, sleeping for 10 seconds and trying again!")
-			# like violence, if it doesn't work, apply more
-			self.reconnect_task = self.loop.create_task(self.trigger_reconnect(10))
+	def connect_ws(self, max_attempts = -1):
+		attempts = 0
+
+		# if we've ever had a web socket, empty ws_queue
+		if self.ws:
+			yield from self.ws_queue.get()
+			self.ws_queue.task_done()
+
+		while True:
+			try:
+				self.ws = yield from websockets.connect(self.room_address)
+				break
+			except:
+				self.debug('connection attempt {} failed', attempts)
+				yield from asyncio.sleep(5)
+				attempts += 1
+				if max_attempts > 0 and attempts >= max_attempts:
+					self.debug('max connection attempts exceeded, closing.')
+					return False
+
+		self.debug('connection succeeded')
+		yield from self.setup()
+		yield from self.ws_queue.put(self.ws)
+
+		new_recv_task = self.loop.create_task(self.recv_loop())
+		if self.recv_task:
+			self.recv_task.cancel()
+		self.recv_task = new_recv_task
+		return True
 
 
-	def set_reconnect_timeout(self, ping_packet):
+	@asyncio.coroutine
+	def connection_monitor(self):
+		# create connection
+		connect_succeeded = yield from self.connect_ws(max_attempts = 1)
+		# sleep to allow first ping
+		yield from asyncio.sleep(2)
+		while True:
+			now = int(time())
+			
+			if not connect_succeeded:
+				self.debug('Max connection attempts exceeded, closing bot.')
+				yield from asyncio.sleep(10)
+				break
+
+			if self.next_ping_timelimit <= now:
+				self.debug('Ping timeout has been missed, re-connecting')
+				connect_succeeded = yield from self.connect_ws(max_attempts = 600)
+			else:
+				yield from asyncio.sleep(self.next_ping_timelimit - now)
+
+	def anticipate_ping(self, ping_packet):
 		now = int(time())
 		latency = now - ping_packet.data['time']
 		if latency != self.last_latency:
@@ -126,10 +167,7 @@ class Bot(object):
 			self.last_latency = latency
 		# delay before reconnect is equal to next - now
 		# plus timeout and travel time
-		delay = (ping_packet.data['next'] - now) + (self.RECONNECT_TIMEOUT + latency)
-		if self.reconnect_task:
-			self.reconnect_task.cancel()
-		self.reconnect_task = self.loop.create_task(self.trigger_reconnect(delay))
+		self.next_ping_timelimit = ping_packet.data['next'] + self.RECONNECT_TIMEOUT + latency
 
 	@asyncio.coroutine
 	def setup(self):
@@ -137,21 +175,7 @@ class Bot(object):
 
 	@asyncio.coroutine
 	def recv_loop(self):
-		yield from self.setup()
 		while True:
-			if not self.ws or not packet: #server d/c or connect
-				yield from self.ws_lock
-				try:
-					self.ws = yield from websockets.connect(self.room_address)
-				except:
-					self.debug('connection failed')
-					yield from asyncio.sleep(1)
-					continue
-
-				self.debug('connection succeeded')
-				self.ws_lock.release()
-				yield from self.setup()
-
 			packet = yield from self.ws.recv()
 			if packet:
 				try:
@@ -162,33 +186,33 @@ class Bot(object):
 				#self.verbose('Packet type: {}', packet.type)
 
 				if packet.type == 'ping-event':
-					self.set_reconnect_timeout(packet)
+					self.anticipate_ping(packet)
 					yield from self.action_queue.put((self.TAG_DO_ACTION, PingAction()))
 				else:
 					for queue in self.packet_queues:
 						yield from queue.put((self.TAG_RAW, packet))
+			else:
+				self.debug("websocket is closed, reconnecting")
+				yield from self.connect_ws(max_attempts = 600)
 
 	@asyncio.coroutine
 	def execute_actions_task(self):
 		while True:
-			if self.ws:
-				tag, action = yield from self.action_queue.get()
-				# set websocket
-				yield from self.ws_lock
-				action.ws = self.ws
-				self.ws_lock.release()
+			tag, action = yield from self.action_queue.get()
+			# set websocket
+			ws = yield from self.ws_queue.get()
+			action.ws = ws
+			yield from self.ws_queue.put(ws)
+			self.ws_queue.task_done()
 
-				#print('processing action: {}'.format(action))
-				task = action.get_coroutine(self.db, self.mid, self.action_queue)
-				asyncio.async(task())
+			#print('processing action: {}'.format(action))
+			task = action.get_coroutine(self.db, self.mid, self.action_queue)
+			asyncio.async(task())
 
-				self.action_queue.task_done()
-			else:
-				yield from asyncio.sleep(1)
+			self.action_queue.task_done()
 			
 
 	def connect(self):
-		action_task = self.loop.create_task(self.execute_actions_task())
+		self.action_task = self.loop.create_task(self.execute_actions_task())
 
-		self.internal_coroutines = [action_task]
-		self.loop.run_until_complete(self.recv_loop())
+		self.loop.run_until_complete(self.connection_monitor())
