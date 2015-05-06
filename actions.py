@@ -182,7 +182,7 @@ class DumpQueue(SongAction):
 		self.queue = queue
 
 	def packet_to_send(self, db):
-		song_queue = self.queued
+		song_queue = self.queue
 		message = 'Nothing Queued'
 		if song_queue:
 			strings = []

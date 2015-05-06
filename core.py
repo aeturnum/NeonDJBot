@@ -244,7 +244,7 @@ class Log(object):
 		for line in full_log.split('\n'):
 			if first:
 				log_lines.append('{}: {}'.format(info_string, line))
-				first = True
+				first = False
 			else:
 				log_lines.append('{}| {}'.format(info_string, line))
 

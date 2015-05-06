@@ -106,7 +106,7 @@ class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 			#self.verbose('message: {}', message.data['content'])
 			db_object = self.create_db_object(message)
 			if db_object:
-				#self.debug('DB Object: {}', db_object)
+				self.debug('DB Object: {}', db_object)
 				if not db_object.is_prepared():
 					try:
 						yield from db_object.prepare() 
@@ -129,6 +129,8 @@ class UsesPackets(UsesMiddleware):
 
 	@classmethod
 	def setup_self(cls, self):
+		self.in_backlog = False
+		self.backlog_processed = False
 		self._recv_functions[PacketMiddleware.CONTROL_TAG] = self.handle_control_message
 
 	@asyncio.coroutine
@@ -137,6 +139,7 @@ class UsesPackets(UsesMiddleware):
 			self.in_backlog = True
 		elif message == PacketMiddleware.CONTROL_BACKLOG_END:
 			self.in_backlog = False
+			self.backlog_processed = True
 
 
 class SimpleActionMiddleware(BotMiddleware, UsesPackets, UsesLogger, SendsActions):
@@ -428,8 +431,8 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesPackets, UsesLogger, SendsAct
 		self.debug("Playing {} in {} seconds.", song_one, delay)
 		yield from asyncio.sleep(delay)
 		song_one, song_two = self.get_next_songs()
-		while self.in_backlog:
-			self.verbose("In backlog messages, holding off on play")
+		while not self.backlog_processed:
+			self.verbose("Backlog not done, waiting")
 			yield from asyncio.sleep(0.5)
 
 		self.expecting_song = True
@@ -458,11 +461,14 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesPackets, UsesLogger, SendsAct
 	def handle_play_event(self, play):
 		self.current_song = play
 		if self.song_queue and self.song_queue[0].youtube_info == play.youtube_info:
+			self.debug('Song matches first song in queue, popping item: {}', self.song_queue[0])
 			self.song_queue.pop(0)
-		to_delete = []
+			return
+
 		for qcommand in self.song_queue:
 			if play.timestamp > qcommand.timestamp\
 				and play.youtube_info == qcommand.youtube_info:
+				self.debug('Play event can satisfy song in queue and so removing out of order queue event: {}', qcommand)
 				self.song_queue.remove(qcommand)
 				break
 
@@ -484,15 +490,19 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesPackets, UsesLogger, SendsAct
 		elif PlayEvent.DB_TAG in message.DB_TAG:
 			self.expecting_song = False
 			self.handle_play_event(message)
+		elif SkipCommand.DB_TAG in message.DB_TAG:
+			self.current_song = None
+			self.expecting_song = False
 		elif ClearQueueCommand.DB_TAG in message.DB_TAG:
 			self.song_queue = []
 		elif ListQueueCommand.DB_TAG in message.DB_TAG:
 			action = ListQueueAction(self.song_queue, self.current_song, reply_to)
 		elif DumpQueueCommand.DB_TAG in message.DB_TAG:
 			action = DumpQueue(self.song_queue)
+			self.song_queue = []
 
 		if action:
-			if self.in_backlog:
+			if not self.backlog_processed:
 				self.verbose('In backlog, would have sent: {}', action)
 			else:
 				yield from self.send_action(action)
