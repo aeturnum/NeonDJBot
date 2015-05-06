@@ -166,12 +166,13 @@ class PlayOneSongAction(PlayQueuedSongAction):
 		return self.song_one, self.song_two
 
 class DumpQueue(SongAction):
-	def __init__(self, reply_to=''):
+	def __init__(self, queue, reply_to=''):
 		super(DumpQueue, self).__init__()
 		self.reply_to = reply_to
+		self.queue = queue
 
 	def packet_to_send(self, db):
-		song_queue = self.queued_songs(db)
+		song_queue = self.queue
 		message = 'Nothing Queued'
 		if song_queue:
 			strings = []

@@ -5,7 +5,8 @@ from core import BotMiddleware, UsesMiddleware, FakeRAWMiddleware, FakeActionMid
 from actions import (
 	QueuedNotificationAction, 
 	PlayOneSongAction, 
-	ListQueueAction
+	ListQueueAction,
+	DumpQueue
 	)
 
 from tinydb import TinyDB, where
@@ -298,8 +299,8 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		elif ListQueueCommand.DB_TAG in message.DB_TAG:
 			action = ListQueueAction(self.song_queue, self.current_song, reply_to)
 		elif DumpQueueCommand.DB_TAG in message.DB_TAG:
-			self.error('dump queue fixme')
-			pass
+			action = DumpQueue(self.song_queue)
+			self.song_queue = []
 
 		if action:
 			if not self.backlog_processed:
