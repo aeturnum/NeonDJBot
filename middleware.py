@@ -127,6 +127,8 @@ class UsesCommands(UsesMiddleware):
 
 	@classmethod
 	def setup_self(cls, self):
+		self.in_backlog = False
+		self.backlog_processed = False
 		self._recv_functions[PacketMiddleware.CONTROL_TAG] = self.handle_control_message
 
 	@asyncio.coroutine
@@ -135,6 +137,7 @@ class UsesCommands(UsesMiddleware):
 			self.in_backlog = True
 		elif message == PacketMiddleware.CONTROL_BACKLOG_END:
 			self.in_backlog = False
+			self.backlog_processed = True
 
 
 class SimpleActionMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsActions):
@@ -228,8 +231,8 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		self.debug("Playing {} in {} seconds.", song_one, delay)
 		yield from asyncio.sleep(delay)
 		song_one, song_two = self.get_next_songs()
-		while self.in_backlog:
-			self.verbose("In backlog messages, holding off on play")
+		while not self.backlog_processed:
+			self.verbose("Backlog not done, waiting")
 			yield from asyncio.sleep(0.5)
 
 		self.expecting_song = True
@@ -299,7 +302,7 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 			pass
 
 		if action:
-			if self.in_backlog:
+			if not self.backlog_processed:
 				self.verbose('In backlog, would have sent: {}', action)
 			else:
 				yield from self.send_action(action)
