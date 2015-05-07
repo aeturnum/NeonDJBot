@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 class YoutubeInfo(object):
 
 	INFO_URL = 'http://gdata.youtube.com/feeds/api/videos/{}?alt=json'
+	INFO_URL2 = 'https://content.googleapis.com/youtube/v3/videos?part=snippet%2C+status%2C+contentDetails&id={id}&key=AIzaSyAnpCOhbLezLbMwDOY0YdHXH4OWhYjXx-o'
 	PLAY_URL = 'https://www.youtube.com/watch?v={id}'
 	REGEX = r'((https?://)?youtube\S+)'
 
@@ -54,7 +55,30 @@ class YoutubeInfo(object):
 		self.title = title
 		self.sub_title = sub_title
 		self.thumbnails = thumbnails
-		self.duration = duration
+		if type(duration) is str:
+			duration = duration[2:]
+			total_seconds = 0
+			while len(duration):
+				i = 0
+				time_str = ''
+				while duration[i] in '0123456789':
+					time_str += duration[i]
+					i += 1
+				unit = duration[i]
+				i += 1
+
+				if unit == 'H':
+					total_seconds += int(time_str)*60*60
+				elif unit == 'M':
+					total_seconds += int(time_str)*60
+				elif unit == 'S':
+					total_seconds += int(time_str)
+
+				duration = duration[i:]
+
+			self.duration = {'seconds':total_seconds}
+		else:
+			self.duration = duration
 		self.prepared = True
 
 	@asyncio.coroutine
@@ -63,14 +87,14 @@ class YoutubeInfo(object):
 			return
 		query = urlparse(self.url).query
 		youtube_id = parse_qs(query)['v'][0]
-		url = self.INFO_URL.format(youtube_id)
+		url = self.INFO_URL2.format(id=youtube_id)
 		resp = yield from aiohttp.request('GET', url)
 		youtube_info = yield from resp.json()
-		youtube_info = youtube_info['entry']
+		youtube_info = youtube_info['items'][0]
 
 		self.set_data(youtube_id,
-			youtube_info['title']['$t'], youtube_info['content']['$t'],
-			youtube_info['media$group']['media$thumbnail'], youtube_info['media$group']['yt$duration'])
+			youtube_info['snippet']['title'], youtube_info['snippet']['description'],
+			youtube_info['snippet']['thumbnails'], youtube_info['contentDetails']['duration'])
 			
 
 	def time_seconds(self):
