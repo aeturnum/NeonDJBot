@@ -15,7 +15,7 @@ class Bot(object):
 
 	RECONNECT_TIMEOUT = 5
 
-	def __init__(self, 	room_address):
+	def __init__(self, 	room_address, db_name='./MusicBotDB.json'):
 		self.loop = asyncio.get_event_loop()
 		self.action_queue = asyncio.JoinableQueue()
 		self.packet_queue = asyncio.JoinableQueue()
@@ -26,7 +26,7 @@ class Bot(object):
 
 		self.room_address = room_address
 		self.ws = None
-		self.db = TinyDB('./MusicBotDB.json')
+		self.db = TinyDB(db_name)
 		self.mid = 0
 
 		self.next_ping_time = int(time()) 
