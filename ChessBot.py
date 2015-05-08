@@ -11,7 +11,7 @@ from actions import SetNickAction, ReplyAction
 # hosted at https://github.com/thomasahle/sunfish
 # I'm not sure what the right way of including sunfish in my repo would be,
 # so you'll have to clone it yourself and put sunfish.py in chessbot's directory.
-# sunfish is GPL, but the actual code is not reproduced here. 
+# This code is considered a derivative work of sunfish and thus is subject to the GPL
 
 from sunfish import Position, initial, parse, search, MATE_VALUE, render
 
@@ -172,7 +172,7 @@ class ChessGameMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsActions)
 
 class ChessBot(Bot):
 
-	def __init__(self, 	room_address):
+	def __init__(self, room_address):
 		super(ChessBot, self).__init__(room_address, './ChessBotDB.json')
 
 	@asyncio.coroutine

@@ -25,3 +25,8 @@ ChessBot.py - uses sunfish (https://github.com/thomasahle/sunfish) to allow user
 I have no tests at the moment :(
 
 They are coming one of these days!
+
+## License
+With the exception of ChessBot.py, this code is released under the MIT license.
+
+ChessBot.py, because it is a derivate work of sunfish, is licensed under the GPL.
