@@ -11,7 +11,7 @@ from actions import SetNickAction, ReplyAction
 # hosted at https://github.com/thomasahle/sunfish
 # I'm not sure what the right way of including sunfish in my repo would be,
 # so you'll have to clone it yourself and put sunfish.py in chessbot's directory.
-# This code is considered a derivative work of sunfish and thus is subject to the GPL
+# This code is considered a derivative work of sunfish and thus is subject to the GPL.
 
 from sunfish import Position, initial, parse, search, MATE_VALUE, render
 
@@ -179,7 +179,7 @@ class ChessBot(Bot):
 	def setup(self):
 		yield from self.action_queue.put((self.TAG_DO_ACTION, SetNickAction("♚|ChessBot|♚")))
 
-bot = ChessBot('wss://euphoria.io/room/test/ws')
+bot = ChessBot('wss://euphoria.io/room/chess/ws')
 bot.add_middleware(SimpleActionMiddleware())
 bot.add_middleware(ChessGameMiddleware())
 
