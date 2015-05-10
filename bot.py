@@ -1,8 +1,11 @@
 import asyncio
 from time import time
-from core import Packet, BotMiddleware, LoggerMiddleware, Log
+import signal
+
 from tinydb import TinyDB
 import websockets
+
+from core import Packet, BotMiddleware, LoggerMiddleware, Log
 
 from actions import (
 	PingAction, 
@@ -43,6 +46,14 @@ class Bot(object):
 		self.add_middleware(LoggerMiddleware())
 		self.log_queue = self.get_input_queue(LoggerMiddleware.TAG)
 
+		signal.signal(signal.SIGINT, self.sigint_handler())
+		self.closing = False
+
+	def sigint_handler(self):
+		def handler(signum, frame):
+			self.closing = True
+		return handler
+
 	def add_middleware(self, middleware):
 		if not middleware.TAG in self.middleware:
 			#print('new middleware: ', middleware)
@@ -55,13 +66,14 @@ class Bot(object):
 
 			middleware.register_queues(self)
 			middleware.load_state_from_db(self.db)
-			middleware.create_task(self.loop, self.db)
 			for tag, request in middleware.MIDDLEWARE_SUPPORT_REQUESTS.items():
 				result = self.middleware[tag].request_support(request)
 				if result != True:
 					middleware.support_request_failed(tag, result)
 					self.error('middleware request for support failed: {} -> {}'.format(middleware, tag))
 					return
+
+			middleware.create_task(self.loop, self.db)
 
 	def recieve_messages_for_tag(self, tag, queue):
 		if tag == self.TAG_RAW:
@@ -121,6 +133,9 @@ class Bot(object):
 				self.ws = yield from websockets.connect(self.room_address)
 				break
 			except:
+				if self.closing:
+					return True
+
 				self.debug('connection attempt {} failed', attempts)
 				yield from asyncio.sleep(5)
 				attempts += 1
@@ -129,35 +144,65 @@ class Bot(object):
 					return False
 
 		self.debug('connection succeeded')
-		yield from self.setup()
-		yield from self.ws_queue.put(self.ws)
+		if self.closing:
+			yield from self.ws.close()
+		else:
+			yield from self.setup()
+			yield from self.ws_queue.put(self.ws)
 
-		new_recv_task = self.loop.create_task(self.recv_loop())
-		if self.recv_task:
-			self.recv_task.cancel()
-		self.recv_task = new_recv_task
+			new_recv_task = self.loop.create_task(self.recv_loop())
+			if self.recv_task:
+				self.recv_task.cancel()
+			self.recv_task = new_recv_task
 		return True
 
+	@asyncio.coroutine
+	def close_bot(self):
+		for m in self.middleware.values():
+			yield from m.start_close()
+
+		if self.ws:
+			yield from self.ws.close()
+
+		while True:
+			done = True
+			for m in self.middleware.values():
+				done = done and m.done()
+
+			if done:
+				break
+			else:
+				yield from asyncio.sleep(0.1)
+
+		# empty queue
+		yield from self.action_queue.join()
+		self.action_task.cancel()
+		
 
 	@asyncio.coroutine
 	def connection_monitor(self):
 		# create connection
 		connect_succeeded = yield from self.connect_ws(max_attempts = 1)
 		# sleep to allow first ping
-		yield from asyncio.sleep(2)
+		yield from asyncio.sleep(1)
 		while True:
 			now = int(time())
-			
+
 			if not connect_succeeded:
 				self.debug('Max connection attempts exceeded, closing bot.')
-				yield from asyncio.sleep(10)
+				self.closing = True
+
+			if self.closing:
+				yield from self.close_bot()
 				break
+
+			yield from self.check_tasks()
 
 			if self.next_ping_timelimit <= now:
 				self.debug('Ping timeout has been missed, re-connecting')
 				connect_succeeded = yield from self.connect_ws(max_attempts = 600)
 			else:
-				yield from asyncio.sleep(self.next_ping_timelimit - now)
+				yield from asyncio.sleep(1)
 
 	def anticipate_ping(self, ping_packet):
 		now = int(time())
@@ -192,13 +237,17 @@ class Bot(object):
 					for queue in self.packet_queues:
 						yield from queue.put((self.TAG_RAW, packet))
 			else:
-				self.debug("websocket is closed, reconnecting")
-				yield from self.connect_ws(max_attempts = 600)
+				if self.closing:
+					break
+				else:
+					self.debug("websocket is closed, reconnecting")
+					yield from self.connect_ws(max_attempts = 600)
 
 	@asyncio.coroutine
 	def execute_actions_task(self):
 		while True:
 			tag, action = yield from self.action_queue.get()
+
 			# set websocket
 			ws = yield from self.ws_queue.get()
 			action.ws = ws
@@ -210,6 +259,31 @@ class Bot(object):
 			asyncio.async(task())
 
 			self.action_queue.task_done()
+
+	@asyncio.coroutine
+	def check_tasks(self):
+		tasks = [(tag, middleware.task) for tag, middleware in self.middleware.items()]
+		tasks.append(('tag_do_action', self.action_task))
+		tasks.append(('tag_raw', self.recv_task))
+
+		for tag, task in tasks:
+			# should not happen, really
+			if task.done():
+				try:
+					result = task.result()
+					self.error('{} middleware done early, returned: {}', tag, result)
+					# catch all the things!
+				except Exception as e:
+					self.exception('{} middleware threw exception: {}', tag, e)
+
+				# again!
+				if tag in self.middleware:
+					middleware = self.middleware[tag]
+					middleware.create_task(self.loop, self.db)
+				elif tag == 'tag_do_action':
+					self.action_task = self.loop.create_task(self.execute_actions_task())
+				elif tag == 'tag_raw':
+					seld.debug('Recv loop will be reconnected by connection monitor.')
 			
 
 	def connect(self):

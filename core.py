@@ -87,12 +87,14 @@ class BotMiddleware(object):
 	TYPE = ''
 	MIDDLEWARE_SUPPORT_REQUESTS = {}
 
+	CLOSING_TAG = 'middleware::closing'
+
 	def __init__(self):
 		super(BotMiddleware, self).__init__()
 		self.input = asyncio.JoinableQueue()
 		self._output = {}
 		self.task = None
-		self._finished = False
+		self.closing = False
 		self._recv_functions = {}
 		self._exception_handler = None
 		self._add_routes()
@@ -139,12 +141,13 @@ class BotMiddleware(object):
 	def support_request_failed(self, middleware_tag, middleware_response):
 		raise ValueError('Middleware {} returned an errror: {}'.format(middleware_tag, middleware_response))
 
-	def cancel(self):
-		if self.task and not self.task.done():
-			self.task.cancel()
+	@asyncio.coroutine
+	def start_close(self):
+		self.closing = True
+		yield from self.input.put((self.CLOSING_TAG, self.CLOSING_TAG))
 
-	def close(self):
-		self._finished = True
+	def done(self):
+		return self.task.done()
 
 	@asyncio.coroutine
 	def setup(self, db):
@@ -159,22 +162,24 @@ class BotMiddleware(object):
 		yield from self.setup(db)
 		while True:
 			tag, data = yield from self.input.get()
-			handler = None
-			try:
-				handler = self._recv_functions[tag]
-			except:
-				print('handler for message type "{}" not found!'.format(tag))
-			try:
-				yield from handler(data)
-			except Exception as e:
-				if self._exception_handler:
-					yield from self._exception_handler(e)
-				pass
+			if tag != self.CLOSING_TAG:
+				handler = None
+				try:
+					handler = self._recv_functions[tag]
+				except:
+					print('handler for message type "{}" not found!'.format(tag))
 
-			if self._finished:
-				break
-				
+				try:
+					yield from handler(data)
+				except Exception as e:
+					if self._exception_handler:
+						yield from self._exception_handler(e)
+			
 			self.input.task_done()
+
+			if self.closing and self.input.empty():
+				break
+
 
 	@staticmethod
 	@asyncio.coroutine

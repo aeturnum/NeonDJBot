@@ -120,6 +120,10 @@ class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 					db_object.set_commands(self.enabled_messages)
 
 				yield from self.send(db_object)
+
+			if self.closing:
+				break
+				
 		if packet.type == 'snapshot-event':
 			yield from self.send_control_message(self.CONTROL_BACKLOG_END)
 
@@ -181,6 +185,12 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		self.in_backlog = False
 		UsesCommands.set_handler(self, self.handle_event)
 
+	@asyncio.coroutine
+	def start_close(self):
+		if self.play_callback:
+			self.play_callback.cancel()
+		yield from super(PlayQueuedSongsMiddleware, self).start_close()
+
 	def status_string(self):
 		return '\n'.join([
 			'QueueMiddleware: Current Song: {}({}s)'.format(self.current_song, self.current_song.remaining_duration() if self.current_song else 'NaN'),
@@ -241,6 +251,9 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		#yield from self.action_queue.put(PlayOneSongAction(song_one, song_two))
 
 	def play_song(self):
+		if self.closing:
+			return
+
 		if self.play_callback:
 			self.play_callback.cancel()
 
