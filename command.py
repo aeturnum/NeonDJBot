@@ -128,6 +128,11 @@ class SkipCommand(Command):
 	def help_string(cls):
 		return "{}: Skip a song. Please note: one song will be skipped per {} command! Use carefully.".format(cls.COMMAND, cls.COMMAND)
 
+class DramaticSkipCommand(Command):
+	DB_TAG = 'database_command_dramatic_skip'
+	COMMAND = '!dramaticskip'
+	COMMAND_LOCATION = 'start'
+
 class TestSkipCommand(Command):
 	DB_TAG = 'database_command_testskip'
 	COMMAND = '!testskip'

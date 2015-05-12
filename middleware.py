@@ -3,6 +3,7 @@ from db_object import DBItem
 from core import BotMiddleware, UsesMiddleware, FakeRAWMiddleware, FakeActionMiddleware, LoggerMiddleware, Log, UsesLogger
 
 from actions import (
+	ReplyAction,
 	QueuedNotificationAction, 
 	PlayOneSongAction, 
 	ListQueueAction,
@@ -15,6 +16,7 @@ from event import PlayEvent
 from command import (
 	QueueCommand, 
 	SkipCommand, 
+	DramaticSkipCommand, #for the my mys
 	ClearQueueCommand, 
 	ListQueueCommand, 
 	TestSkipCommand,
@@ -170,7 +172,7 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 	LOG_NAME = 'Queue'
 	MIDDLEWARE_SUPPORT_REQUESTS = {
 		PacketMiddleware.TAG: [
-			QueueCommand, SkipCommand, ClearQueueCommand, ListQueueCommand, TestSkipCommand, DumpQueueCommand, PlayEvent
+			QueueCommand, SkipCommand, ClearQueueCommand, ListQueueCommand, TestSkipCommand, DumpQueueCommand, PlayEvent, DramaticSkipCommand
 		]
 	}
 
@@ -307,6 +309,8 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		elif SkipCommand.DB_TAG in message.DB_TAG:
 			self.current_song = None
 			self.expecting_song = False
+		elif DramaticSkipCommand.DB_TAG in message.DB_TAG:
+			action = ReplyAction("!play https://www.youtube.com/watch?v=a1Y73sPHKxw")
 		elif ClearQueueCommand.DB_TAG in message.DB_TAG:
 			self.song_queue = []
 		elif ListQueueCommand.DB_TAG in message.DB_TAG:
