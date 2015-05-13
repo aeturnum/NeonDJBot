@@ -10,6 +10,7 @@ from core import Packet, BotMiddleware, LoggerMiddleware, Log
 from actions import (
 	PingAction, 
 	SetNickAction, 
+	ActionTracker
 	)
 
 class Bot(object):
@@ -244,18 +245,41 @@ class Bot(object):
 					yield from self.connect_ws(max_attempts = 600)
 
 	@asyncio.coroutine
+	def ws_queue_alarm(self):
+		yield from asyncio.sleep(2)
+		self.debug('ws queue has blocked for 2 seconds')
+		yield from asyncio.sleep(8)
+		self.error('ws queue has blocked for 10 seconds')
+		yield from asyncio.sleep(30)
+		self.exception('ws queue has blocked for 30 seconds')
+
+	@asyncio.coroutine
+	def action_alarm(self, tracker):
+		sleeps = [3, 7, 20]
+		for sleep in sleeps:
+			yield from asyncio.sleep(sleep)
+			if tracker.done:
+				break
+
+			self.debug(tracker.log_str())
+
+	@asyncio.coroutine
 	def execute_actions_task(self):
 		while True:
 			tag, action = yield from self.action_queue.get()
 
 			# set websocket
+			queue_alarm = asyncio.async(self.ws_queue_alarm())
 			ws = yield from self.ws_queue.get()
 			action.ws = ws
 			yield from self.ws_queue.put(ws)
 			self.ws_queue.task_done()
+			queue_alarm.cancel()
 
 			#print('processing action: {}'.format(action))
-			task = action.get_coroutine(self.db, self.mid, self.action_queue)
+			tracker = ActionTracker(action)
+			action_alarm = asyncio.async(self.action_alarm(tracker))
+			task = action.get_coroutine(self.db, self.mid, self.action_queue, tracker)
 			asyncio.async(task())
 
 			self.action_queue.task_done()
