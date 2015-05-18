@@ -283,9 +283,8 @@ class LoggerMiddleware(BotMiddleware):
 			file_name = log.file if log.file else self.default_file
 			fh = self.log_files[file_name]
 			print(log.log_str())
-			if log.level < Log.VERBOSE:
-				fh.write(log.log_str() + '\n')
-				fh.flush()
+			fh.write(log.log_str() + '\n')
+			fh.flush()
 
 class UsesLogger(UsesMiddleware):
 	PRODUCES = LoggerMiddleware

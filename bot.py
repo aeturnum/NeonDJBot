@@ -9,8 +9,7 @@ from core import Packet, BotMiddleware, LoggerMiddleware, Log
 
 from actions import (
 	PingAction, 
-	SetNickAction, 
-	ActionTracker
+	SetNickAction
 	)
 
 class Bot(object):
@@ -27,6 +26,7 @@ class Bot(object):
 
 		self.action_task = None
 		self.recv_task = None
+		self.running_actions = []
 
 		self.room_address = room_address
 		self.ws = None
@@ -254,14 +254,16 @@ class Bot(object):
 		self.exception('ws queue has blocked for 30 seconds')
 
 	@asyncio.coroutine
-	def action_alarm(self, tracker):
+	def action_alarm(self, action):
 		sleeps = [3, 7, 20]
+		total_time = 0
 		for sleep in sleeps:
 			yield from asyncio.sleep(sleep)
-			if tracker.done:
+			if action.done:
 				break
 
-			self.debug(tracker.log_str())
+			self.debug('Action {} has been running for {} seconds!', action, sleep)
+			total_time += sleep
 
 	@asyncio.coroutine
 	def execute_actions_task(self):
@@ -272,15 +274,16 @@ class Bot(object):
 			queue_alarm = asyncio.async(self.ws_queue_alarm())
 			ws = yield from self.ws_queue.get()
 			action.ws = ws
+			action.set_log_queue(self.log_queue)
 			yield from self.ws_queue.put(ws)
 			self.ws_queue.task_done()
 			queue_alarm.cancel()
 
 			#print('processing action: {}'.format(action))
-			tracker = ActionTracker(action)
-			action_alarm = asyncio.async(self.action_alarm(tracker))
-			task = action.get_coroutine(self.db, self.mid, self.action_queue, tracker)
-			asyncio.async(task())
+			action_alarm = asyncio.async(self.action_alarm(action))
+			task = action.get_coroutine(self.db, self.mid, self.action_queue)
+			action_task = self.loop.create_task(task())
+			self.running_actions.append(action_task)
 
 			self.action_queue.task_done()
 
@@ -289,6 +292,7 @@ class Bot(object):
 		tasks = [(tag, middleware.task) for tag, middleware in self.middleware.items()]
 		tasks.append(('tag_do_action', self.action_task))
 		tasks.append(('tag_raw', self.recv_task))
+		finished_actions = [running_action for running_action in self.running_actions if running_action.done()]
 
 		for tag, task in tasks:
 			# should not happen, really
@@ -308,6 +312,14 @@ class Bot(object):
 					self.action_task = self.loop.create_task(self.execute_actions_task())
 				elif tag == 'tag_raw':
 					seld.debug('Recv loop will be reconnected by connection monitor.')
+
+		for done_action in finished_actions:
+			try:
+				e = done_action.exception()
+				if e:
+					self.exception('Action {} encountered an exception while executing: {}', done_action, e)
+			except CancelledError:
+				self.exception('Action {} was cancled?!', done_action)
 			
 
 	def connect(self):

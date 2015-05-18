@@ -4,86 +4,66 @@ from datetime import timedelta, datetime
 from websockets.exceptions import InvalidState
 import json
 
-class ActionTracker(object):
-	def __init__(self, action):
-		self.action = action
-		self.start = int(time())
-		self.states = []
-		self.state = 'Action Created'
-		self.done = False
-	
-	def _add_state(self, state):
-		self.states.append({
-				'name': state,
-				'time': int(time())}
-			)
-
-	def enter_task(self):
-		self._add_state('Entered Task')
-
-	def packet_generated(self):
-		self._add_state('Packet Generated')
-
-	def message_id_set(self):
-		self._add_state('Message ID Set')
-
-	def about_to_send(self):
-		self._add_state('About To Send')
-
-	def send_succeeded(self):
-		self._add_state('Send Succeeded')
-
-	def invalid_websocket(self):
-		self._add_state('Invalid Websocket')
-
-	def invalid_packet(self):
-		self._add_state('Invalid Packet')
-
-	def finish(self):
-		self._add_state('finished')
-		self.done = True
-
-	def log_str(self):
-		s = []
-		last_time = self.start
-		for state in self.states:
-			s.append('[+{}|{}]'.format(state['time'] - last_time, state['name']))
-			last_time = state['time'] 
-
-		return 'Action: {}\n{}s|->{}'.format(self.action, last_time - self.start, ', '.join(s))
-
-
 class Action(object):
 	def __init__(self):
 		self.ws = None
 		self.timestamp = int(time())
+		self.log_queue = None
+		self.done = False
+		self.log_executing = True
+
+	def set_log_queue(self, queue):
+		self.log_queue = queue
+
+	#do doo do, poor engineering practices
+	# copied and pasted from logging middleware because I am a bad person
+	@asyncio.coroutine
+	def log(self, level, *args):
+		from middleware import LoggerMiddleware, Log
+		if self.log_queue:
+			l = Log(level, 'ACTION', *args)
+			yield from self.log_queue.put((LoggerMiddleware.TAG ,l))
+
+	def exception(self, *args):
+		from middleware import Log
+		asyncio.async(self.log(Log.EXCEPTION, *args))
+
+	def error(self, *args):
+		from middleware import Log
+		asyncio.async(self.log(Log.ERROR, *args))
+
+	def debug(self, *args):
+		from middleware import Log
+		asyncio.async(self.log(Log.DEBUG, *args))
+
+	def verbose(self, *args):
+		from middleware import Log
+		asyncio.async(self.log(Log.VERBOSE, *args))
 
 	def packet_to_send(self, db):
 		return None
 
-	def get_coroutine(self, db, id_generator, action_queue, tracker):
+	def get_coroutine(self, db, id_generator, action_queue):
 		@asyncio.coroutine
 		def task():
-			tracker.enter_task()
+			if self.log_executing:
+				self.debug('{}: Executing.', self)
 			message = self.packet_to_send(db)
-			tracker.packet_generated()
 			if message:
 				# set id
 				message['id'] = str(next(id_generator))
-				tracker.message_id_set()
 				try:
-					tracker.about_to_send()
 					yield from self.ws.send(json.dumps(message))
-					tracker.send_succeeded()
 				except InvalidState:
 					# websocket closed
-					tracker.invalid_websocket()
+					self.error('{}: websocket closed!', self)
 					yield from action_queue.put(self)
 				except TypeError:
-					tracker.invalid_packet()
-					print('{} - Failed to send: {}'.format(self, json.dumps(message)))
+					self.error('{}: Failed to send: {}', self, json.dumps(message))
 				finally:
-					tracker.finish()
+					self.done = True
+
+			self.done = True
 
 		return task
 
@@ -111,6 +91,7 @@ class PacketAction(Action):
 class PingAction(PacketAction):
 	def __init__(self):
 		super(PingAction, self).__init__()
+		self.log_executing = False
 
 	def packet_to_send(self, db):
 		return self.ping_packet(self.timestamp)
@@ -129,6 +110,7 @@ class SetNickAction(PacketAction):
 	def __init__(self, nick):
 		super(SetNickAction, self).__init__()
 		self.nick = nick
+		self.log_executing = False
 
 	def packet_to_send(self, db):
 		return self.nick_packet(self.nick)
