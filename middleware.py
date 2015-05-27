@@ -15,6 +15,7 @@ from event import PlayEvent
 
 from command import (
 	QueueCommand, 
+	QueueFirstCommand,
 	SkipCommand, 
 	DramaticSkipCommand, #for the my mys
 	ClearQueueCommand, 
@@ -75,12 +76,13 @@ class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 
 	def create_db_object(self, packet):
 		content = packet.data['content']
-		for event_class in self.enabled_messages:
-			if event_class.is_this(content):
-				try:
-					return event_class(packet)
-				except:
-					self.exception('failed to create: {}', packet.data)
+		possibles = [(event_class.is_this(content), event_class) for event_class in self.enabled_messages]
+		score, event_class = sorted(possibles, key=lambda x: x[0])[-1]
+		if score > 0:
+			try:
+				return event_class(packet)
+			except:
+				self.exception('failed to create: {}', packet.data)
 		return None
 
 	def save_to_db(self, db_item):
@@ -104,7 +106,7 @@ class PacketMiddleware(BotMiddleware, UsesLogger, UsesRaw):
 					self.verbose('ignoring {}', message.data['content'])
 				continue
 
-			#self.verbose('message: {}', message.data['content'])
+			self.verbose('message: {}', message.data['content'])
 			db_object = self.create_db_object(message)
 			if db_object:
 				self.debug('DB Object: {}', db_object)
@@ -172,7 +174,7 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 	LOG_NAME = 'Queue'
 	MIDDLEWARE_SUPPORT_REQUESTS = {
 		PacketMiddleware.TAG: [
-			QueueCommand, SkipCommand, ClearQueueCommand, ListQueueCommand, TestSkipCommand, DumpQueueCommand, PlayEvent, DramaticSkipCommand
+			QueueCommand, SkipCommand, ClearQueueCommand, ListQueueCommand, TestSkipCommand, DumpQueueCommand, PlayEvent, DramaticSkipCommand, QueueFirstCommand
 		]
 	}
 
@@ -269,11 +271,6 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 			self.play_later(delay)
 			)
 
-	def handle_queue_command(self, command):
-		#self.debug('handle_queue_command: ', command)
-		self.song_queue.append(command)
-		#self.debug('\tqueue:', self.song_queue)
-
 	def handle_play_event(self, play):
 		self.current_song = play
 		if self.song_queue and self.song_queue[0].youtube_info == play.youtube_info:
@@ -300,9 +297,13 @@ class PlayQueuedSongsMiddleware(BotMiddleware, UsesCommands, UsesLogger, SendsAc
 		if self.current_song and self.current_song.remaining_duration() == 0:
 			self.current_song = None
 
-		if QueueCommand.DB_TAG in message.DB_TAG:
-			self.handle_queue_command(message)
+		if QueueCommand.DB_TAG == message.DB_TAG:
+			self.song_queue.append(message)
 			action = QueuedNotificationAction(self.song_queue, self.current_song, message.youtube_info, reply_to)
+		elif QueueFirstCommand.DB_TAG == message.DB_TAG:
+			self.song_queue.insert(0, message)
+			# null queue as its first
+			action = QueuedNotificationAction([], self.current_song, message.youtube_info, reply_to)
 		elif PlayEvent.DB_TAG in message.DB_TAG:
 			self.expecting_song = False
 			self.handle_play_event(message)

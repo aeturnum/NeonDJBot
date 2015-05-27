@@ -1,3 +1,4 @@
+
 import asyncio
 
 from db_object import DBItem
@@ -33,7 +34,10 @@ class Event(DBItem):
 
 	@classmethod
 	def is_this(cls, message):
-		return cls.EVENT_TEXT in message.lower()
+		count = 0
+		if cls.EVENT_TEXT in message.lower():
+			count = len(cls.EVENT_TEXT)
+		return count
 
 	def __repr__(self):
 		return str(self)

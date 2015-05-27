@@ -12,8 +12,8 @@ from actions import (
 class Command(DBItem):
 	DB_TAG = 'database_command'
 	TYPE = 'base'
-	COMMAND = ''
-	COMMAND_LOCATION = 'any'
+	COMMAND = ['']
+	COMMAND_LOCATION = 'start'
 
 	def __init__(self, message_or_db):
 		super(Command, self).__init__(message_or_db)
@@ -26,6 +26,15 @@ class Command(DBItem):
 		return []
 
 	@classmethod
+	def command_string(cls, args = None):
+		c_str = cls.COMMAND[0]
+		if len(cls.COMMAND) > 1:
+			c_str = '(alt: {}) {}'.format(', '.join(cls.COMMAND[1:]), c_str)
+		if args:
+			c_str = '{} {}'.format(c_str, args)
+		return c_str
+
+	@classmethod
 	def help_string(cls):
 		return None
 
@@ -36,10 +45,13 @@ class Command(DBItem):
 
 	@classmethod
 	def is_this(cls, message):
-		if cls.COMMAND_LOCATION == 'any':
-			return cls.COMMAND in message.lower()
-		elif cls.COMMAND_LOCATION == 'start':
-			return message.lower().find(cls.COMMAND) == 0 
+		low_message = message.lower()
+		matches = [0]
+		for alias in cls.COMMAND:
+			if message.lower().find(alias) == 0:
+				matches.append(len(alias))
+
+		return max(matches)
 
 	def __repr__(self):
 		return str(self)
@@ -51,7 +63,7 @@ class Command(DBItem):
 class QueueCommand(Command):
 	DB_TAG = 'database_command_queue'
 	TYPE = 'queue'
-	COMMAND = '!queue'
+	COMMAND = ['!queue', '!q']
 	COMMAND_LOCATION = 'start'
 
 	def __init__(self, message_or_db):
@@ -82,19 +94,31 @@ class QueueCommand(Command):
 
 	@classmethod
 	def help_string(cls):
-		return "{} <youtube url> : Add a song to the queue. Does not support any link shorterners (youtube's included). Songs will be played in order.".format(cls.COMMAND)
+		return "{}: Add a song to the queue. Does not support any link shorterners (youtube's included). Songs will be played in order.".format(cls.command_string('<youtube url>'))
 
 	def __str__(self):
 		return '[QueueCommand] {}'.format(self.youtube_info)
 
+class QueueFirstCommand(QueueCommand):
+	DB_TAG = 'database_command_queue_first'
+	COMMAND = ['!queuefirst', '!qf']
+	COMMAND_LOCATION = 'start'
+
+	@classmethod
+	def help_string(cls):
+		return "{}: Add a song at the start of the queue. Same restrictions as !queue.".format(cls.command_string('<youtube url>'))
+
+	def __str__(self):
+		return '[QueueFirstCommand] {}'.format(self.youtube_info)	
+
 class ClearQueueCommand(Command):
 	DB_TAG = 'database_command_clearqueue'
-	COMMAND = '!clearqueue'
+	COMMAND = ['!clearqueue']
 	COMMAND_LOCATION = 'start'
 
 class ListQueueCommand(Command):
 	DB_TAG = 'database_command_listqueue'
-	COMMAND = '!list'
+	COMMAND = ['!list']
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
@@ -102,11 +126,11 @@ class ListQueueCommand(Command):
 
 	@classmethod
 	def help_string(cls):
-		return "{}: List the songs currently in the queue.".format(cls.COMMAND)
+		return "{}: List the songs currently in the queue.".format(cls.command_string())
 
 class DumpQueueCommand(Command):
 	DB_TAG = 'database_command_dumpqueue'
-	COMMAND = '!dumpqueue'
+	COMMAND = ['!dumpqueue']
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
@@ -114,11 +138,11 @@ class DumpQueueCommand(Command):
 
 	@classmethod
 	def help_string(cls):
-		return "{}: List all queued songs with youtube URL included and then DELETES the queue. Useful for shutting down the bot.".format(cls.COMMAND)
+		return "{}: List all queued songs with youtube URL included and then DELETES the queue. Useful for shutting down the bot.".format(cls.command_string())
 
 class SkipCommand(Command):
 	DB_TAG = 'database_command_skip'
-	COMMAND = '!skip'
+	COMMAND = ['!skip']
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
@@ -126,16 +150,16 @@ class SkipCommand(Command):
 
 	@classmethod
 	def help_string(cls):
-		return "{}: Skip a song. Please note: one song will be skipped per {} command! Use carefully.".format(cls.COMMAND, cls.COMMAND)
+		return "{}: Skip a song. Please note: one song will be skipped per command! Use carefully.".format(cls.command_string())
 
 class DramaticSkipCommand(Command):
 	DB_TAG = 'database_command_dramatic_skip'
-	COMMAND = '!dramaticskip'
+	COMMAND = ['!dramaticskip']
 	COMMAND_LOCATION = 'start'
 
 class TestSkipCommand(Command):
 	DB_TAG = 'database_command_testskip'
-	COMMAND = '!testskip'
+	COMMAND = ['!testskip']
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
@@ -143,7 +167,7 @@ class TestSkipCommand(Command):
 
 class NeonLightShowCommand(Command):
 	DB_TAG = 'database_command_neonlightshow'
-	COMMAND = '!neonlightshow'
+	COMMAND = ['!neonlightshow']
 	COMMAND_LOCATION = 'start'
 
 	def get_actions(self):
@@ -157,7 +181,7 @@ class NeonLightShowCommand(Command):
 
 class HelpCommand(Command):
 	DB_TAG = 'database_command_help'
-	COMMAND = '!help'
+	COMMAND = ['!help']
 	COMMAND_LOCATION = 'start'
 
 	def set_commands(self, commands):
@@ -181,6 +205,7 @@ class HelpCommand(Command):
 
 DBItem.SUBCLASSES.update({
 		QueueCommand.DB_TAG: QueueCommand,
+		QueueFirstCommand.DB_TAG: QueueFirstCommand,
 		SkipCommand.DB_TAG: SkipCommand,
 		ClearQueueCommand.DB_TAG: ClearQueueCommand,
 		ListQueueCommand.DB_TAG: ListQueueCommand,
